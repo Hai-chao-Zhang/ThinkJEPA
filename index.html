@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ThinkJEPA | Project Page</title>
+  <meta
+    name="description"
+    content="ThinkJEPA is a dual-branch latent world model that combines a cortex-like VLM reasoner with a cerebellum-like JEPA controller for semantically grounded, physically consistent downstream prediction and control."
+  >
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&display=swap"
+    rel="stylesheet"
+  >
+  <script>
+    (function () {
+      var storedTheme = null;
+      try {
+        storedTheme = localStorage.getItem("thinkjepa-theme");
+      } catch (error) {
+        storedTheme = null;
+      }
+      var prefersDark = window.matchMedia &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches;
+      var theme = storedTheme || (prefersDark ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f1ea;
+      --bg-top: #f7f4ee;
+      --paper: #fffdf8;
+      --panel-bg: rgba(255, 253, 248, 0.9);
+      --paper-soft: #faf7f0;
+      --card-bg: #ffffff;
+      --card-alt: #f8fafc;
+      --figure-bg: linear-gradient(180deg, #ffffff, #f6f8fc);
+      --ink: #162133;
+      --muted: #556173;
+      --line: #d8dfeb;
+      --line-strong: #bcc8d8;
+      --accent: #203b75;
+      --accent-soft: #edf2fb;
+      --gold: #8a6d2f;
+      --brand-icon-bg: linear-gradient(180deg, #ffffff, #f3f6fb);
+      --button-secondary-bg: #ffffff;
+      --grid: rgba(22, 33, 51, 0.035);
+      --radial-tint: rgba(138, 109, 47, 0.06);
+      --shadow: 0 18px 48px rgba(22, 33, 51, 0.08);
+      --max: 1180px;
+      --radius-lg: 22px;
+      --radius-md: 16px;
+      --radius-sm: 12px;
+    }
+
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0b1220;
+      --bg-top: #10192a;
+      --paper: #111a2a;
+      --panel-bg: rgba(16, 25, 42, 0.88);
+      --paper-soft: #0f1828;
+      --card-bg: #121d30;
+      --card-alt: #162238;
+      --figure-bg: linear-gradient(180deg, #162238, #0f1828);
+      --ink: #ebf1fb;
+      --muted: #93a3bd;
+      --line: #27344b;
+      --line-strong: #384864;
+      --accent: #94b4ff;
+      --accent-soft: #172742;
+      --gold: #d4b16f;
+      --brand-icon-bg: linear-gradient(180deg, #18253c, #10192c);
+      --button-secondary-bg: #121d30;
+      --grid: rgba(148, 180, 255, 0.08);
+      --radial-tint: rgba(148, 180, 255, 0.12);
+      --shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, var(--radial-tint), transparent 28%),
+        linear-gradient(180deg, var(--bg-top) 0%, var(--bg) 100%);
+      font-family: "IBM Plex Sans", "Avenir Next", sans-serif;
+      line-height: 1.6;
+      transition: background-color 220ms ease, color 220ms ease;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(var(--grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+      background-size: 34px 34px;
+      mask-image: linear-gradient(180deg, black 0%, rgba(0, 0, 0, 0.15) 80%, transparent 100%);
+    }
+
+    img {
+      max-width: 100%;
+      display: block;
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    code {
+      padding: 0.18rem 0.42rem;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 0.92em;
+      font-family: ui-monospace, "SFMono-Regular", monospace;
+    }
+
+    .page {
+      width: min(var(--max), calc(100% - 28px));
+      margin: 0 auto;
+      padding: 20px 0 64px;
+      position: relative;
+    }
+
+    .panel {
+      background: var(--panel-bg);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+      transition: background-color 220ms ease, border-color 220ms ease, box-shadow 220ms ease;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 14px;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 14px 18px;
+      margin-top: 8px;
+    }
+
+    .topbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .brand-icon {
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      background: var(--brand-icon-bg);
+      border: 1px solid var(--line);
+      padding: 7px;
+      flex: none;
+      transition: background 220ms ease, border-color 220ms ease;
+    }
+
+    .brand-copy {
+      min-width: 0;
+    }
+
+    .brand-copy strong,
+    .brand-copy span {
+      display: block;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .brand-copy strong {
+      font-size: 0.98rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .brand-copy span {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+
+    .nav a {
+      color: var(--muted);
+      padding: 8px 12px;
+      border-radius: 999px;
+      transition: color 160ms ease, background-color 160ms ease;
+    }
+
+    .nav a:hover {
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .theme-toggle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      padding: 0 14px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--button-secondary-bg);
+      color: var(--accent);
+      font: inherit;
+      font-size: 0.92rem;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      cursor: pointer;
+      transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease, transform 180ms ease;
+    }
+
+    .theme-toggle:hover {
+      background: var(--accent-soft);
+      transform: translateY(-1px);
+    }
+
+    .theme-toggle:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.9fr);
+      gap: 24px;
+      margin-top: 28px;
+    }
+
+    .hero-main {
+      padding: 34px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--card-bg);
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.79rem;
+      font-weight: 600;
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      font-family: "Source Serif 4", Georgia, serif;
+      line-height: 1.06;
+      letter-spacing: -0.01em;
+    }
+
+    h1 {
+      font-size: clamp(2.8rem, 7vw, 5.2rem);
+      margin-top: 22px;
+      max-width: 10ch;
+    }
+
+    h2 {
+      font-size: clamp(2rem, 4.6vw, 3rem);
+    }
+
+    h3 {
+      font-size: 1.45rem;
+    }
+
+    .hero-wordmark {
+      width: min(560px, 100%);
+      margin-top: 22px;
+    }
+
+    .hero-subtitle {
+      margin: 22px 0 0;
+      font-size: 1.08rem;
+      color: var(--muted);
+      max-width: 64ch;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    .button,
+    .button-secondary {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      min-height: 46px;
+      padding: 0 18px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-weight: 600;
+    }
+
+    .button {
+      background: var(--accent);
+      color: #ffffff;
+      box-shadow: 0 10px 24px rgba(32, 59, 117, 0.16);
+    }
+
+    .button-secondary {
+      border-color: var(--line);
+      background: var(--button-secondary-bg);
+      color: var(--accent);
+    }
+
+    .hero-meta {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    .hero-metric {
+      padding: 15px 16px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--paper-soft);
+    }
+
+    .hero-metric strong {
+      display: block;
+      font-size: 1.28rem;
+      margin-bottom: 5px;
+    }
+
+    .hero-metric span {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .hero-side {
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .figure-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--figure-bg);
+      padding: 16px;
+    }
+
+    .figure-card img {
+      width: 100%;
+      height: auto;
+      object-fit: contain;
+      border-radius: 12px;
+    }
+
+    .figure-caption {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .abstract {
+      padding: 18px 20px;
+      border-left: 3px solid var(--accent);
+      background: var(--accent-soft);
+      border-radius: 0 var(--radius-md) var(--radius-md) 0;
+    }
+
+    .abstract strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 0.9rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    .section {
+      margin-top: 24px;
+      padding: 28px;
+    }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      align-items: end;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }
+
+    .section-head p {
+      margin: 0;
+      max-width: 66ch;
+      color: var(--muted);
+    }
+
+    .two-brain {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .brain-card {
+      padding: 22px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--line);
+      background: var(--card-bg);
+    }
+
+    .brain-kicker {
+      color: var(--gold);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.8rem;
+      font-weight: 700;
+    }
+
+    .brain-card p {
+      margin: 12px 0 0;
+      color: var(--muted);
+    }
+
+    .brain-card ul {
+      margin: 14px 0 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    .method-grid {
+      display: grid;
+      grid-template-columns: minmax(280px, 0.86fr) minmax(0, 1.14fr);
+      gap: 18px;
+    }
+
+    .method-visual,
+    .method-notes {
+      padding: 22px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--line);
+      background: var(--card-bg);
+    }
+
+    .pipeline {
+      display: grid;
+      gap: 14px;
+    }
+
+    .pipeline-step {
+      position: relative;
+      padding: 15px 16px 15px 18px;
+      border-left: 3px solid var(--accent);
+      background: var(--paper-soft);
+      border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    }
+
+    .pipeline-step strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 1rem;
+    }
+
+    .pipeline-step span {
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .method-notes ul {
+      margin: 14px 0 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    .evidence-grid {
+      display: grid;
+      grid-template-columns: 1.04fr 0.96fr;
+      gap: 18px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.95rem;
+      background: var(--card-bg);
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      border: 1px solid var(--line);
+    }
+
+    th,
+    td {
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+    }
+
+    th {
+      background: var(--card-alt);
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    td:first-child {
+      font-weight: 600;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .note-card {
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--card-bg);
+    }
+
+    .note-card p {
+      margin: 12px 0 0;
+      color: var(--muted);
+    }
+
+    .release-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
+      gap: 16px;
+    }
+
+    .release-main,
+    .release-side {
+      padding: 22px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--line);
+      background: var(--card-bg);
+    }
+
+    .release-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 7px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line-strong);
+      background: var(--card-alt);
+      color: var(--accent);
+      font-size: 0.84rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .citation {
+      margin-top: 24px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--paper-soft);
+    }
+
+    .citation pre {
+      margin: 12px 0 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--muted);
+      font-family: ui-monospace, "SFMono-Regular", monospace;
+      font-size: 0.92rem;
+      line-height: 1.55;
+    }
+
+    footer {
+      padding: 28px 2px 8px;
+      color: var(--muted);
+      font-size: 0.93rem;
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(14px);
+      transition: opacity 520ms ease, transform 520ms ease;
+    }
+
+    .reveal.is-visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    @media (max-width: 960px) {
+      .hero,
+      .method-grid,
+      .evidence-grid,
+      .release-grid,
+      .two-brain {
+        grid-template-columns: 1fr;
+      }
+
+      .hero-meta {
+        grid-template-columns: 1fr;
+      }
+
+      .topbar {
+        border-radius: 20px;
+      }
+
+      .topbar-actions,
+      .nav {
+        justify-content: flex-start;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .page {
+        width: min(var(--max), calc(100% - 18px));
+      }
+
+      .topbar,
+      .hero-main,
+      .hero-side,
+      .section {
+        padding: 18px;
+      }
+
+      h1 {
+        font-size: clamp(2.5rem, 14vw, 4rem);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="topbar panel reveal">
+      <div class="brand">
+        <img class="brand-icon" src="logo/logo.png" alt="ThinkJEPA logo">
+        <div class="brand-copy">
+          <strong>ThinkJEPA</strong>
+          <span>Project page for arXiv:2603.22281</span>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <nav class="nav" aria-label="Primary">
+          <a href="#abstract">Abstract</a>
+          <a href="#story">Story</a>
+          <a href="#method">Method</a>
+          <a href="#evidence">Evidence</a>
+          <a href="#release">Release</a>
+        </nav>
+        <button
+          class="theme-toggle"
+          type="button"
+          data-theme-toggle
+          aria-label="Toggle color theme"
+          aria-pressed="false"
+        >
+          Theme: Light
+        </button>
+      </div>
+    </header>
+
+    <section class="hero">
+      <div class="hero-main panel reveal">
+        <div class="eyebrow">Latent world models + vision-language reasoning</div>
+        <img
+          class="hero-wordmark"
+          src="logo/thinkjepa.png"
+          alt="ThinkJEPA wordmark"
+        >
+        <h1>Two Brains, One World Model.</h1>
+        <p class="hero-subtitle">
+          ThinkJEPA pairs a cortex-like VLM reasoner for high-level semantics and long-horizon
+          intent with a cerebellum-like JEPA controller for low-level dynamics, physical
+          consistency, and fast local correction. Together they form a semantically grounded latent
+          world model for downstream embodied prediction and control.
+        </p>
+        <div class="hero-actions">
+          <a class="button" href="https://arxiv.org/abs/2603.22281" target="_blank" rel="noreferrer">
+            arXiv
+          </a>
+          <a class="button-secondary" href="https://github.com/Hai-chao-Zhang/Thinker_World" target="_blank" rel="noreferrer">
+            GitHub
+          </a>
+          <a class="button-secondary" href="https://huggingface.co/datasets/haichaozhang/cache" target="_blank" rel="noreferrer">
+            Hugging Face Cache
+          </a>
+        </div>
+        <div class="hero-meta">
+          <div class="hero-metric">
+            <strong>Dual-Temporal</strong>
+            <span>Dense JEPA observation plus uniformly sampled VLM reasoning.</span>
+          </div>
+          <div class="hero-metric">
+            <strong>Pyramid Guidance</strong>
+            <span>Multi-layer VLM signals guide prediction instead of only the final layer.</span>
+          </div>
+          <div class="hero-metric">
+            <strong>Early May 2026</strong>
+            <span>Current target window for broader public code release.</span>
+          </div>
+        </div>
+      </div>
+
+      <aside class="hero-side panel reveal">
+        <div class="figure-card">
+          <img src="logo/logo.png" alt="ThinkJEPA emblem">
+          <div class="figure-caption">
+            <strong>Inside the ThinkJEPA.</strong>
+            The VLM serves as a cortex-like reasoner, capturing high-level semantics and
+            long-horizon intent.
+            The JEPA branch behaves more like a cerebellum-like controller, modeling low-level
+            dynamics, physical consistency, and rapid local corrections.
+          </div>
+        </div>
+        <div id="abstract" class="abstract">
+          <strong>Abstract</strong>
+          ThinkJEPA addresses a central limitation of dense latent world models: they forecast well
+          at the local physical level, but often miss long-horizon semantics and intent. The paper
+          combines a dense JEPA branch with a larger-stride VLM thinker branch and injects
+          multi-layer VLM reasoning into the predictor through hierarchical pyramid representation
+          extraction, improving downstream trajectory prediction and long-horizon rollout behavior.
+        </div>
+      </aside>
+    </section>
+
+    <section id="story" class="section panel reveal">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">Story</div>
+          <h2>A Cortex and a Cerebellum</h2>
+        </div>
+        <p>
+          The project story is simple and memorable: ThinkJEPA has two complementary brains. One
+          brain thinks. The other brain controls. The paper's dual-temporal architecture maps
+          naturally onto that idea without reducing the method to a metaphor.
+        </p>
+      </div>
+
+      <div class="two-brain">
+        <article class="brain-card">
+          <div class="brain-kicker">Cortex-like reasoner</div>
+          <h3>The VLM branch thinks at a higher semantic level.</h3>
+          <p>
+            The VLM serves as a cortex-like reasoner, capturing high-level semantics, general
+            knowledge, and long-horizon intent from uniformly sampled frames with a larger temporal
+            stride.
+          </p>
+          <ul>
+            <li>Understands what is happening, not only how pixels move.</li>
+            <li>Brings in broader world knowledge learned from large-scale multimodal pretraining.</li>
+            <li>Guides the predictor toward intent, context, and semantics over longer horizons.</li>
+          </ul>
+        </article>
+
+        <article class="brain-card">
+          <div class="brain-kicker">Cerebellum-like controller</div>
+          <h3>The JEPA branch keeps the model physically grounded.</h3>
+          <p>
+            The JEPA branch behaves more like a cerebellum-like controller, modeling low-level
+            dynamics, physical consistency, contact-sensitive motion, and rapid local corrections.
+          </p>
+          <ul>
+            <li>Tracks dense local motion that sparse VLM processing can miss.</li>
+            <li>Provides the fine-grained control signal needed for robotic hands and other effectors.</li>
+            <li>Supports downstream embodied tasks, with the paper's current experiments centered on hand-manipulation trajectory prediction.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="method" class="section panel reveal">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">Method</div>
+          <h2>Dual-Temporal Pathway with Pyramid Guidance</h2>
+        </div>
+        <p>
+          Reading the paper closely, the method hinges on three ideas: keep a dense JEPA pathway
+          for physical forecasting, add a large-stride VLM thinker pathway for semantics, and use
+          hierarchical pyramid extraction so the predictor can benefit from the VLM's progressive
+          reasoning process instead of only a terminal representation.
+        </p>
+      </div>
+
+      <div class="method-grid">
+        <div class="method-visual">
+          <h3>Architecture Outline</h3>
+          <div class="pipeline" style="margin-top: 16px;">
+            <div class="pipeline-step">
+              <strong>1. Dense JEPA branch</strong>
+              <span>Consumes densely sampled observations to preserve local dynamics and interaction cues.</span>
+            </div>
+            <div class="pipeline-step">
+              <strong>2. VLM thinker branch</strong>
+              <span>Processes uniformly sampled frames at a larger temporal stride to capture broader intent and semantic context.</span>
+            </div>
+            <div class="pipeline-step">
+              <strong>3. Pyramid representation extraction</strong>
+              <span>Aggregates intermediate and deep VLM representations into guidance signals compatible with latent prediction.</span>
+            </div>
+            <div class="pipeline-step">
+              <strong>4. Predictor and task head</strong>
+              <span>Injects VLM guidance into JEPA prediction and outputs downstream trajectory forecasts for embodied tasks.</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="method-notes">
+          <h3>What matters technically</h3>
+          <ul>
+            <li>The VLM is used as guidance, not as a standalone dense predictor.</li>
+            <li>The larger temporal stride gives the reasoning branch a broader perception field.</li>
+            <li>Multi-layer VLM features are more useful than relying only on a final language-oriented layer.</li>
+            <li>The latent forecasting interface is preserved, which keeps the method useful for downstream control-oriented tasks.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="evidence" class="section panel reveal">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">Evidence</div>
+          <h2>Why the Two-Brain Story is Useful</h2>
+        </div>
+        <p>
+          The paper's core empirical message is not merely that "more features help." It is that
+          semantic reasoning helps most when it guides, rather than replaces, a physically grounded
+          latent predictor.
+        </p>
+      </div>
+
+      <div class="evidence-grid">
+        <div>
+          <table aria-label="Curated result snapshot">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>ADE</th>
+                <th>FDE</th>
+                <th>Accuracy</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>ThinkJEPA</td>
+                <td>0.0614</td>
+                <td>0.0556</td>
+                <td>0.5960</td>
+              </tr>
+              <tr>
+                <td>VJEPA_only</td>
+                <td>0.0706</td>
+                <td>0.0656</td>
+                <td>0.4706</td>
+              </tr>
+              <tr>
+                <td>VLM_only</td>
+                <td>0.1420</td>
+                <td>0.1441</td>
+                <td>0.0842</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="note-card">
+          <h3>Interpretation</h3>
+          <p>
+            The VLM-only line underperforms badly on fine-grained prediction, which matches the
+            paper's argument that language-aligned reasoning alone is not an adequate substitute
+            for dense physical modeling.
+          </p>
+          <p>
+            The JEPA-only line remains strong on local forecasting, but ThinkJEPA improves it by
+            adding broader intent and semantic grounding. That is exactly the motivation behind the
+            cortex / cerebellum story.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="release" class="section panel reveal">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">Release</div>
+          <h2>Current Branch and Next Release Window</h2>
+        </div>
+        <p>
+          This branch is a project-page snapshot rather than the full research workspace. It keeps
+          the webpage, logo assets, and a small curated code surface while a broader code release is
+          prepared.
+        </p>
+      </div>
+
+      <div class="release-grid">
+        <div class="release-main">
+          <div class="release-badge">Code Release Window</div>
+          <h3 style="margin-top: 14px;">Early May 2026</h3>
+          <p style="margin-top: 12px; color: var(--muted);">
+            As of April 1, 2026, the broader public code release is planned for early May 2026.
+            Until then, this page presents the paper, the project story, and a focused subset of
+            implementation files.
+          </p>
+        </div>
+
+        <div class="release-side">
+          <h3>Current Status</h3>
+          <p style="margin-top: 12px; color: var(--muted);">
+            This project page presents the paper's central idea, method framing, and release
+            window while the broader public code release is being prepared.
+          </p>
+        </div>
+      </div>
+
+      <div class="citation">
+        <div class="eyebrow">Citation</div>
+        <pre>@article{zhang2026thinkjepa,
+  title={ThinkJEPA: Empowering Latent World Models with Large Vision-Language Reasoning Model},
+  author={Zhang, Haichao and Li, Yijiang and He, Shwai and Nagarajan, Tushar and Chen, Mingfei and Lu, Jianglin and Li, Ang and Fu, Yun},
+  journal={arXiv preprint arXiv:2603.22281},
+  year={2026}
+}</pre>
+      </div>
+    </section>
+
+    <footer>
+      Project page based on the ThinkJEPA paper
+      (<a href="https://arxiv.org/pdf/2603.22281" target="_blank" rel="noreferrer">arXiv:2603.22281</a>).
+    </footer>
+  </div>
+
+  <script>
+    const root = document.documentElement;
+    const themeToggle = document.querySelector("[data-theme-toggle]");
+
+    function applyTheme(theme) {
+      root.setAttribute("data-theme", theme);
+      if (themeToggle) {
+        themeToggle.textContent = theme === "dark" ? "Theme: Dark" : "Theme: Light";
+        themeToggle.setAttribute("aria-pressed", theme === "dark" ? "true" : "false");
+      }
+    }
+
+    applyTheme(root.getAttribute("data-theme") || "light");
+
+    if (themeToggle) {
+      themeToggle.addEventListener("click", () => {
+        const nextTheme = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+        applyTheme(nextTheme);
+        try {
+          localStorage.setItem("thinkjepa-theme", nextTheme);
+        } catch (error) {
+          // Ignore storage failures and keep the current theme in memory.
+        }
+      });
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("is-visible");
+          }
+        }
+      },
+      { threshold: 0.15 }
+    );
+
+    document.querySelectorAll(".reveal").forEach((node) => observer.observe(node));
+  </script>
+</body>
+</html>
