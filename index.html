@@ -309,6 +309,45 @@
       margin-top: 22px;
     }
 
+    .hero-title {
+      margin-top: 22px;
+      max-width: 18ch;
+      font-size: clamp(2.45rem, 5.4vw, 4.3rem);
+    }
+
+    .hero-authors {
+      margin-top: 18px;
+      font-size: 1.02rem;
+      line-height: 1.72;
+    }
+
+    .hero-authors sup,
+    .hero-affiliations sup {
+      font-size: 0.72em;
+      vertical-align: super;
+    }
+
+    .hero-affiliations {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.75;
+      max-width: 72ch;
+    }
+
+    .hero-contact {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.7;
+    }
+
+    .hero-contact a {
+      color: var(--accent);
+      text-decoration: underline;
+      text-underline-offset: 0.15em;
+    }
+
     .hero-subtitle {
       margin: 22px 0 0;
       font-size: 1.08rem;
@@ -334,6 +373,12 @@
       border-radius: 999px;
       border: 1px solid transparent;
       font-weight: 600;
+    }
+
+    .button-icon {
+      width: 1.08rem;
+      height: 1.08rem;
+      flex: none;
     }
 
     .button {
@@ -703,7 +748,21 @@
           src="logo/thinkjepa.png"
           alt="ThinkJEPA wordmark"
         >
-        <h1>Two Brains, One World Model.</h1>
+        <h1 class="hero-title">ThinkJEPA: Empowering Latent World Models with Large Vision-Language Reasoning Model</h1>
+        <div class="hero-authors">
+          Haichao Zhang<sup>1</sup>, Yijiang Li<sup>2</sup>, Shwai He<sup>3</sup>, Tushar Nagarajan<sup>4</sup>, Mingfei Chen<sup>5</sup>, Jianglin Lu<sup>1</sup>, Ang Li<sup>3</sup>, and Yun Fu<sup>1</sup>
+        </div>
+        <div class="hero-affiliations">
+          <sup>1</sup> Northeastern University &nbsp;&nbsp;&nbsp;
+          <sup>2</sup> University of California San Diego &nbsp;&nbsp;&nbsp;
+          <sup>3</sup> University of Maryland &nbsp;&nbsp;&nbsp;
+          <sup>4</sup> The University of Texas at Austin &nbsp;&nbsp;&nbsp;
+          <sup>5</sup> University of Washington
+        </div>
+        <div class="hero-contact">
+          For questions about this public release, or if you encounter any issues reproducing the released setup, please contact
+          <a href="mailto:zhang.haich@northeastern.edu">zhang.haich@northeastern.edu</a>.
+        </div>
         <p class="hero-subtitle">
           ThinkJEPA pairs a cortex-like VLM reasoner for high-level semantics and long-horizon
           intent with a cerebellum-like JEPA controller for low-level dynamics, physical
@@ -712,12 +771,29 @@
         </p>
         <div class="hero-actions">
           <a class="button" href="https://arxiv.org/abs/2603.22281" target="_blank" rel="noreferrer">
+            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M7.75 3.75h7.25L19.25 8v11a1.25 1.25 0 0 1-1.25 1.25H7.75A1.25 1.25 0 0 1 6.5 19V5A1.25 1.25 0 0 1 7.75 3.75Z" />
+              <path d="M14.75 3.75V8h4.5" />
+              <path d="M9 15.75 12 9l3 6.75" />
+              <path d="M10 13.75h4" />
+            </svg>
             arXiv
           </a>
-          <a class="button-secondary" href="https://github.com/Hai-chao-Zhang/Thinker_World" target="_blank" rel="noreferrer">
+          <a class="button-secondary" href="https://github.com/Hai-chao-Zhang/ThinkJEPA" target="_blank" rel="noreferrer">
+            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+              <path d="M12 .75a11.25 11.25 0 0 0-3.56 21.92c.56.1.76-.24.76-.54v-1.9c-3.1.67-3.75-1.31-3.75-1.31-.5-1.28-1.23-1.62-1.23-1.62-1-.68.08-.67.08-.67 1.11.08 1.69 1.14 1.69 1.14.98 1.69 2.58 1.2 3.2.92.1-.72.38-1.2.68-1.47-2.47-.28-5.06-1.24-5.06-5.52 0-1.22.44-2.22 1.15-3-.12-.28-.5-1.41.11-2.93 0 0 .94-.3 3.08 1.14a10.66 10.66 0 0 1 5.6 0c2.13-1.44 3.07-1.14 3.07-1.14.61 1.52.23 2.65.11 2.93.72.78 1.15 1.78 1.15 3 0 4.29-2.6 5.23-5.08 5.51.39.34.74 1.01.74 2.04v3.02c0 .3.2.65.77.54A11.25 11.25 0 0 0 12 .75Z" />
+            </svg>
             GitHub
           </a>
           <a class="button-secondary" href="https://huggingface.co/datasets/haichaozhang/cache" target="_blank" rel="noreferrer">
+            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="8.5" />
+              <path d="M9.25 10.5v.35" />
+              <path d="M14.75 10.5v.35" />
+              <path d="M8.75 14.1c.75 1.2 1.9 1.8 3.25 1.8s2.5-.6 3.25-1.8" />
+              <path d="M6.65 12.55c-.62-.2-1.1-.78-1.1-1.52 0-.88.72-1.6 1.6-1.6.18 0 .36.03.52.08" />
+              <path d="M17.35 12.55c.62-.2 1.1-.78 1.1-1.52 0-.88-.72-1.6-1.6-1.6-.18 0-.36.03-.52.08" />
+            </svg>
             Hugging Face Cache
           </a>
         </div>
@@ -731,8 +807,8 @@
             <span>Multi-layer VLM signals guide prediction instead of only the final layer.</span>
           </div>
           <div class="hero-metric">
-            <strong>Early May 2026</strong>
-            <span>Current target window for broader public code release.</span>
+            <strong>Code Just Released</strong>
+            <span>Let us know if you run into any problems.</span>
           </div>
         </div>
       </div>
@@ -920,31 +996,29 @@
       <div class="section-head">
         <div>
           <div class="eyebrow">Release</div>
-          <h2>Current Branch and Next Release Window</h2>
+          <h2>Code Just Released</h2>
         </div>
         <p>
-          This branch is a project-page snapshot rather than the full research workspace. It keeps
-          the webpage, logo assets, and a small curated code surface while a broader code release is
-          prepared.
+          This branch is a project-page snapshot with the released webpage, logo assets, and
+          public code surface. Let us know if you run into any problems when using the release.
         </p>
       </div>
 
       <div class="release-grid">
         <div class="release-main">
-          <div class="release-badge">Code Release Window</div>
-          <h3 style="margin-top: 14px;">Early May 2026</h3>
+          <div class="release-badge">Public Release</div>
+          <h3 style="margin-top: 14px;">Code Just Released</h3>
           <p style="margin-top: 12px; color: var(--muted);">
-            As of April 1, 2026, the broader public code release is planned for early May 2026.
-            Until then, this page presents the paper, the project story, and a focused subset of
-            implementation files.
+            The public ThinkJEPA code is now available. If anything is unclear or inconvenient when
+            setting up, running, or reproducing the released code, please let us know.
           </p>
         </div>
 
         <div class="release-side">
-          <h3>Current Status</h3>
+          <h3>Need Help?</h3>
           <p style="margin-top: 12px; color: var(--muted);">
-            This project page presents the paper's central idea, method framing, and release
-            window while the broader public code release is being prepared.
+            This project page presents the paper, the released code, and supporting resources. If
+            you run into any problems, please reach out and let us know.
           </p>
         </div>
       </div>

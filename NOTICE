@@ -1,0 +1,35 @@
+ThinkJEPA
+
+This product includes or is derived from ThinkJEPA.
+
+Original project:
+ThinkJEPA: Empowering Latent World Models with Large Vision-Language Reasoning Model
+
+Authors:
+- Haichao Zhang
+- Yun Raymond Fu
+
+Institution:
+Northeastern University, NEU SMILE LAB
+
+Original source repository:
+https://github.com/Hai-chao-Zhang/ThinkJEPA
+
+Recommended citation:
+If you use, modify, redistribute, evaluate, or publicly describe software that
+includes or is derived from ThinkJEPA, please retain this NOTICE file, retain
+the applicable LICENSE files, cite the ThinkJEPA paper where citation
+practices apply, and include a visible link to the original repository above.
+
+Recommended paper citation:
+Haichao Zhang, Yijiang Li, Shwai He, Tushar Nagarajan, Mingfei Chen,
+Jianglin Lu, Ang Li, and Yun Raymond Fu.
+"ThinkJEPA: Empowering Latent World Models with Large Vision-Language
+Reasoning Model."
+arXiv preprint arXiv:2603.22281, 2026.
+
+Branch note:
+This `html` branch is a lightweight project-page snapshot that includes the
+webpage, logo assets, and a curated code surface. The root ThinkJEPA license,
+notice, and citation files are included here to preserve the same attribution
+and citation requirements as the public ThinkJEPA release.
