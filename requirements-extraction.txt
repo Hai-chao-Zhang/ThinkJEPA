@@ -1,0 +1,16 @@
+# Additional packages for Qwen3-VL cache extraction.
+# Install torch / torchvision / torchaudio / torchcodec separately with a CUDA-matched build.
+
+accelerate>=1.12
+decord>=0.6
+h5py>=3.16
+huggingface-hub>=1.4.1
+matplotlib>=3.10
+numpy>=2.2
+pillow>=12.0
+pyyaml>=6.0.3
+qwen-vl-utils>=0.0.14
+safetensors>=0.7.0
+sentencepiece>=0.2.1
+tqdm>=4.67
+transformers>=5.2.0

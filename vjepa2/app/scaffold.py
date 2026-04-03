@@ -1,0 +1,21 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+import importlib
+import logging
+import sys
+
+from fbvscodedebug import start_debugger
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+logger = logging.getLogger()
+
+
+def main(app, args, resume_preempt=False):
+    # start_debugger()
+    logger.info(f"Running pre-training of app: {app}")
+    return importlib.import_module(f"app.vjepa_droid.train").main(
+        args=args, resume_preempt=resume_preempt
+    )
