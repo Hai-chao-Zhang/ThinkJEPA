@@ -6,15 +6,22 @@
 # Original source: https://github.com/Hai-chao-Zhang/ThinkJEPA
 # See the root LICENSE, NOTICE, CITATION.cff, and CITATION.bib for attribution and citation requirements.
 
+# The standalone CLI adds its bundled V-JEPA source root before importing it.
+# ruff: noqa: E402
+
 import argparse
 import glob
+import hashlib
+import inspect
 import json
-import os, random
+import os
+import random
 import re
 import sys
 import time
-from functools import partial  # NEW
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -39,27 +46,23 @@ for _path in (
     if _path_str not in sys.path:
         sys.path.insert(0, _path_str)
 
-import vjepa2.src.datasets.utils.video.transforms as video_transforms
-import vjepa2.src.datasets.utils.video.volume_transforms as volume_transforms
-
 from cache_train.models import (
     TrajectoryReadoutMLP,
 )
-from cache_train.hf_egodex import (
-    DEFAULT_EGODEX_PART2_HF_DIR,
+from cache_train.runtime_paths import (
     configure_huggingface_cache_dirs,
-    is_huggingface_cache_path,
     resolve_egodex_data_reference,
 )
 from cache_train.checkpoint_paths import resolve_dense_jepa_checkpoint
 from cache_train.thinker_predictor import CortexGuidedVideoPredictor
 
-from egodex.trajectory_dataset import CameraGeometryLoadError, build_egodex_dataloaders
+from egodex.trajectory_dataset import build_egodex_dataloaders
 from egodex.utils.draw_utils import write_video_frames_to_mp4
 from egodex.visualize_2d import render_hand_projection
 
 from cache_train.video_observation_adapter import VideoObservationAdapter
 
+import hand_skeleton_consts as hand_skeleton_consts_module
 from hand_skeleton_consts import (
     IMAGENET_DEFAULT_MEAN,
     IMAGENET_DEFAULT_STD,
@@ -74,8 +77,6 @@ from hand_skeleton_consts import (
     visualize_flag,
 )
 
-from cache_train.predictor import PatchwiseAutoregressiveRolloutHead
-from vjepa2.src.models.predictor import VisionTransformerPredictor  # NEW
 from vjepa2.src.models.vision_transformer import vit_large_rope
 
 
@@ -197,6 +198,49 @@ def write_json_atomic(obj, path):
                 tmp_path.unlink()
         except Exception:
             pass
+
+
+def portable_output_ref(value, output_dir):
+    """Return a portable artifact reference without exposing host paths."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw)
+    try:
+        return path.resolve(strict=False).relative_to(
+            Path(output_dir).resolve(strict=False)
+        ).as_posix()
+    except (ValueError, OSError):
+        return path.name
+
+
+def build_training_logs(logs, output_dir):
+    """Copy metrics state while replacing checkpoint paths with local refs."""
+    portable_logs = dict(logs)
+    best = dict(logs.get("best") or {})
+    if "ckpt" in best:
+        best["ckpt"] = portable_output_ref(best.get("ckpt"), output_dir)
+    portable_logs["best"] = best
+    portable_logs["epochs"] = [
+        {
+            **row,
+            "ckpt": portable_output_ref(row.get("ckpt"), output_dir),
+        }
+        if isinstance(row, dict)
+        else row
+        for row in logs.get("epochs", [])
+    ]
+    return portable_logs
+
+
+def checkpoint_should_update(policy, validation_ade, best_ade):
+    """Return whether the current epoch should replace ``ckpt_best.pt``."""
+    normalized = str(policy).strip().lower()
+    if normalized == "last":
+        return True
+    if normalized in {"best", "validation"}:
+        return float(validation_ade) < float(best_ade)
+    raise ValueError(f"unsupported checkpoint_selection={normalized!r}")
 
 
 def write_text_file(text: str, path):
@@ -374,6 +418,462 @@ def load_json_or_default(path, default):
     return default
 
 
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def compute_training_implementation_fingerprint() -> str:
+    """Bind checkpoints to the exact local training/model implementations."""
+    source_paths = {
+        Path(__file__).resolve(),
+        (REPO_ROOT / "cache_train" / "thinker_predictor.py").resolve(),
+        Path(inspect.getsourcefile(TrajectoryReadoutMLP) or "").resolve(),
+        Path(inspect.getsourcefile(build_egodex_dataloaders) or "").resolve(),
+        Path(inspect.getsourcefile(vit_large_rope) or "").resolve(),
+        Path(hand_skeleton_consts_module.__file__).resolve(),
+    }
+    digest = hashlib.sha256()
+    for path in sorted(source_paths, key=str):
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"training implementation dependency is missing: {path}"
+            )
+        try:
+            source_label = path.relative_to(REPO_ROOT).as_posix()
+        except ValueError:
+            source_label = str(path)
+        digest.update(source_label.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(sha256_file(path).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def validate_group_aware_split_metadata(args) -> None:
+    """Prove that supplied manifests came from a disjoint group-aware split."""
+    train_manifest = str(getattr(args, "train_manifest", "") or "")
+    test_manifest = str(getattr(args, "test_manifest", "") or "")
+    if not train_manifest or not test_manifest:
+        return  # build_egodex_dataloaders emits the canonical missing-manifest error.
+    split_meta_path = str(getattr(args, "split_meta", "") or "")
+    if not split_meta_path:
+        raise ValueError(
+            "group-aware manifest mode requires --split_meta from "
+            "cache_train/build_video_cache_splits.py"
+        )
+    with Path(split_meta_path).open("r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    if (
+        meta.get("split_mode") != "group_aware"
+        or bool(meta.get("sample_level_split", True))
+        or int(meta.get("group_intersection_count", -1)) != 0
+        or meta.get("group_intersection_assertion_passed") is not True
+    ):
+        raise ValueError(f"invalid split metadata: {split_meta_path}")
+
+    from cache_train.portable_split import (
+        PORTABLE_SPLIT_SCHEMA,
+        validate_portable_split_bundle,
+    )
+
+    if meta.get("split_schema") != PORTABLE_SPLIT_SCHEMA:
+        raise ValueError(
+            "ThinkJEPA training requires portable-v1 split metadata and rejects "
+            "machine-bound absolute manifests"
+        )
+
+    if meta.get("split_schema") == PORTABLE_SPLIT_SCHEMA:
+        runtime_data_root = str(getattr(args, "data_dir", "") or "").strip()
+        runtime_cache_root = str(getattr(args, "cache_dir", "") or "").strip()
+        if not runtime_data_root or not runtime_cache_root:
+            raise ValueError(
+                "portable split validation requires explicit supervision and cache roots"
+            )
+        validated = validate_portable_split_bundle(
+            meta=meta,
+            split_meta_path=split_meta_path,
+            train_manifest=train_manifest,
+            test_manifest=test_manifest,
+            supervision_root=runtime_data_root,
+            cache_root=runtime_cache_root,
+            # Recompute the content hashes recorded in pairs.jsonl so a copied
+            # or relocated bundle cannot substitute same-sized supervision.
+            verify_supervision_content=True,
+        )
+
+        from cache_train.build_video_cache_splits import (
+            hash_group_keys,
+            infer_video_group_key,
+        )
+
+        dataset = str(meta.get("dataset", ""))
+        group_regex = meta.get("group_regex") or None
+        resolved_group_by = str(meta.get("group_by_resolved", ""))
+        group_by = (
+            str(meta.get("group_by_requested", "auto"))
+            if resolved_group_by == "regex"
+            else resolved_group_by
+        )
+
+        def portable_group_keys(relative_paths):
+            sentinel_root = "/portable-supervision-root"
+            return {
+                infer_video_group_key(
+                    dataset,
+                    str(Path(sentinel_root) / Path(path).with_suffix(".mp4")),
+                    sentinel_root,
+                    group_by=group_by,
+                    group_regex=group_regex,
+                )
+                for path in relative_paths
+            }
+
+        train_groups = portable_group_keys(validated["train_relpaths"])
+        test_groups = portable_group_keys(validated["test_relpaths"])
+        intersection = train_groups & test_groups
+        if (
+            intersection
+            or hash_group_keys(train_groups) != str(meta.get("train_group_hash", ""))
+            or hash_group_keys(test_groups) != str(meta.get("test_group_hash", ""))
+        ):
+            raise ValueError(
+                "portable manifest-derived groups do not match the recorded split; "
+                f"intersection={sorted(intersection)[:10]}"
+            )
+        args.supervision_manifest_stat_fingerprint = str(
+            validated["supervision_identity_sha256"]
+        )
+        args.supervision_file_count = int(validated["supervision_file_count"])
+        args.split_meta_sha256 = sha256_file(split_meta_path)
+        args.train_manifest_sha256 = str(validated["train_hash"])
+        args.test_manifest_sha256 = str(validated["test_hash"])
+        return
+
+
+def validate_completed_cache_gate(args) -> None:
+    """Require a complete cache validation report and success marker."""
+    if not bool(getattr(args, "use_npz_cache", False)):
+        raise ValueError("ThinkJEPA training requires the validated schema-v2 NPZ cache")
+
+    cache_root = Path(str(getattr(args, "cache_dir", ""))).expanduser().resolve()
+    portable_meta = None
+    split_meta_value = str(getattr(args, "split_meta", "") or "").strip()
+    if split_meta_value:
+        split_meta_candidate = Path(split_meta_value).expanduser().resolve()
+        if split_meta_candidate.is_file():
+            with split_meta_candidate.open("r", encoding="utf-8") as handle:
+                candidate_meta = json.load(handle)
+            if candidate_meta.get("split_schema") == "thinkjepa.group_split.portable.v1":
+                portable_meta = candidate_meta
+    if portable_meta is None:
+        raise ValueError(
+            "ThinkJEPA training requires portable-v1 split metadata from the local bundle"
+        )
+    default_parent = cache_root.parent
+    report_path = Path(
+        str(getattr(args, "cache_validation_report", "") or default_parent / "full_validation.json")
+    ).expanduser().resolve()
+    marker_path = Path(
+        str(getattr(args, "cache_validation_marker", "") or default_parent / "VALIDATED_SUCCESS")
+    ).expanduser().resolve()
+    if not marker_path.is_file():
+        raise FileNotFoundError(
+            "causal cache is not approved for training: missing success marker "
+            f"{marker_path}"
+        )
+    if not report_path.is_file():
+        raise FileNotFoundError(
+            "causal cache is not approved for training: missing validation report "
+            f"{report_path}"
+        )
+    with report_path.open("r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    report_path_mode = str(report.get("path_mode", ""))
+    if report_path_mode != "bundle_relative":
+        raise ValueError(
+            "ThinkJEPA training requires bundle-relative cache validation and rejects "
+            "machine-bound validation reports"
+        )
+    if (
+        report.get("status") != "ok"
+        or report.get("schema") != "thinkjepa.causal_split.v2"
+        or report.get("extractor_version") != "2.0.5"
+        or int(report.get("raw_count", -1)) != int(report.get("cache_count", -2))
+        or int(report.get("cache_count", -1)) <= 0
+        or int(report.get("raw_content_duplicate_count", -1)) != 0
+        or report.get("cache_files_write_protected") is not True
+    ):
+        raise ValueError(f"unsafe or incomplete cache validation report: {report_path}")
+    if report_path_mode == "bundle_relative":
+        from cache_train.portable_split import normalize_relative_posix_path
+
+        if portable_meta is None:
+            raise ValueError(
+                "bundle-relative cache validation requires portable-v1 split metadata"
+            )
+        report_cache_relpath = normalize_relative_posix_path(
+            str(report.get("cache_root", ""))
+        )
+        report_cache_root = (
+            report_path.parent / Path(report_cache_relpath)
+        ).resolve()
+        try:
+            report_cache_root.relative_to(report_path.parent)
+        except ValueError as exc:
+            raise ValueError(
+                "bundle-relative cache root escapes validation root"
+            ) from exc
+        if not report_cache_root.is_dir():
+            raise FileNotFoundError(
+                f"bundle-relative cache root is missing: {report_cache_root}"
+            )
+
+        # Raw videos are not consumed by cache training and the documented
+        # offline bundle may omit them.  If a portable report declares a raw
+        # root, however, validate it strictly rather than silently accepting a
+        # partial or substituted raw layer.
+        report_raw_value = str(report.get("raw_root", "") or "").strip()
+        if report_raw_value:
+            report_raw_relpath = normalize_relative_posix_path(report_raw_value)
+            report_raw_root = (
+                report_path.parent / Path(report_raw_relpath)
+            ).resolve()
+            try:
+                report_raw_root.relative_to(report_path.parent)
+            except ValueError as exc:
+                raise ValueError(
+                    "bundle-relative raw root escapes validation root"
+                ) from exc
+            if not report_raw_root.is_dir():
+                raise FileNotFoundError(
+                    f"bundle-relative raw root is missing: {report_raw_root}"
+                )
+            if len(list(report_raw_root.rglob("*.mp4"))) != int(
+                report.get("raw_count", -1)
+            ):
+                raise ValueError(
+                    "bundle-relative raw-video set differs from cache validation"
+                )
+    expected_count = int(report.get("cache_count", -1))
+    if report_cache_root != cache_root:
+        raise ValueError(
+            "cache validation report belongs to a different root: "
+            f"report={report_cache_root} current={cache_root}"
+        )
+    if portable_meta is not None and (
+        int(portable_meta.get("supervision_file_count", -1)) != expected_count
+        or str(portable_meta.get("feature_config_fingerprint", ""))
+        != str(report.get("configuration_fingerprint", ""))
+    ):
+        raise ValueError(
+            "portable split feature identity differs from the completed cache validation"
+        )
+    if report_path_mode == "bundle_relative":
+        portable_meta_sha256 = sha256_file(split_meta_candidate)
+        pairs_sha256 = str(
+            portable_meta.get("supervision_pairs_manifest_sha256", "")
+        )
+        if (
+            report.get("portable_split_schema")
+            != "thinkjepa.group_split.portable.v1"
+            or report.get("portable_split_meta_sha256") != portable_meta_sha256
+            or report.get("supervision_pairs_manifest_sha256") != pairs_sha256
+        ):
+            raise ValueError(
+                "bundle-relative cache report is not bound to portable split metadata"
+            )
+        try:
+            marker_contract = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(
+                "bundle-relative VALIDATED_SUCCESS must contain its validation contract"
+            ) from exc
+        if (
+            marker_contract.get("schema")
+            != "thinkjepa.cache_validation.portable.v1"
+            or marker_contract.get("full_validation_sha256")
+            != sha256_file(report_path)
+            or marker_contract.get("portable_split_meta_sha256")
+            != portable_meta_sha256
+            or marker_contract.get("supervision_pairs_manifest_sha256")
+            != pairs_sha256
+        ):
+            raise ValueError(
+                "bundle-relative VALIDATED_SUCCESS identity does not match the report"
+            )
+    if marker_path.parent != report_path.parent:
+        raise ValueError(
+            "cache success marker and validation report must share one root"
+        )
+    cache_files = sorted(cache_root.rglob("*.npz"))
+    if len(cache_files) != expected_count:
+        raise ValueError(
+            "cache contents changed after validation: "
+            f"report={expected_count} current={len(cache_files)}"
+        )
+    if any(path.stat().st_mode & 0o222 for path in cache_files):
+        raise ValueError(
+            "validated cache contains writable archives; materialize the HF revision "
+            "into a dedicated local data root, remove write bits from cache/**/*.npz "
+            "(for example: chmod a-w), then rerun cache validation"
+        )
+    report_fingerprint = str(report.get("configuration_fingerprint", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", report_fingerprint):
+        raise ValueError(f"cache validation report has no valid fingerprint: {report_path}")
+    args.cache_validation_report = str(report_path)
+    args.cache_validation_marker = str(marker_path)
+    args.cache_validation_report_sha256 = sha256_file(report_path)
+    args.validated_cache_fingerprint = report_fingerprint
+
+
+def bind_training_contract(args) -> None:
+    """Hash semantic settings so resume cannot cross experiment protocols."""
+    args.training_implementation_fingerprint = (
+        compute_training_implementation_fingerprint()
+    )
+    fields = (
+        "training_implementation_fingerprint",
+        "predictor",
+        "backbone",
+        "trajmode",
+        "epochs",
+        "use_npz_cache",
+        "skip_vjepa",
+        "past_T",
+        "future_T",
+        "temporal_stride",
+        "temporal_causal_attn",
+        "thinkjepa_use_vlm_merge",
+        "thinkjepa_use_cache_ext",
+        "thinkjepa_vlm_source",
+        "thinkjepa_vlm_layer_selector",
+        "thinkjepa_vlm_layer_index",
+        "thinkjepa_vlm_cond_mode",
+        "thinkjepa_drop_thinking_tokens",
+        "thinkjepa_think_start_ids",
+        "thinkjepa_think_end_ids",
+        "thinkjepa_think_drop_ids",
+        "thinkjepa_think_token_pad_id",
+        "thinkjepa_think_prefix_open",
+        "thinkjepa_think_drop_prefix_len",
+        "thinkjepa_think_drop_suffix_len",
+        "thinkjepa_zero_dropped_think_tokens",
+        "joint_pred",
+        "ref_mode",
+        "camera_mode",
+        "optimize_together_downstream",
+        "lambda_task",
+        "lambda_pred",
+        "lr",
+        "lr_pred",
+        "train_batch_size",
+        "grad_accum",
+        "ddp_world_size",
+        "effective_global_batch_size",
+        "ddp_find_unused_parameters",
+        "no_amp",
+        "skip_nonfinite_loss",
+        "seed",
+        "checkpoint_selection",
+        "vlm_pad_old_to",
+        "vlm_pad_new_to",
+        "load_cache_images",
+        "max_train_batches",
+        "max_eval_batches",
+        "smoke_only",
+    )
+    contract = {name: getattr(args, name, None) for name in fields}
+    encoded = json.dumps(
+        contract, sort_keys=True, separators=(",", ":"), default=str
+    )
+    args.training_contract_json = encoded
+    args.training_contract_sha256 = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def build_training_run_identity(args) -> dict:
+    keys = (
+        "training_implementation_fingerprint",
+        "supervision_manifest_stat_fingerprint",
+        "supervision_file_count",
+        "cache_config_fingerprint",
+        "cache_validation_report_sha256",
+        "split_meta_sha256",
+        "train_manifest_sha256",
+        "test_manifest_sha256",
+        "training_contract_sha256",
+    )
+    return {key: str(getattr(args, key, "") or "") for key in keys}
+
+
+def fresh_training_logs(args) -> dict:
+    return {
+        "run_kind": "smoke" if bool(getattr(args, "smoke_only", False)) else "training",
+        "run_identity": build_training_run_identity(args),
+        "epochs": [],
+        "best": {
+            "epoch": -1,
+            "ade": float("inf"),
+            "fde": float("inf"),
+            "loss": float("inf"),
+            "pred_loss": float("inf"),
+            "pred_latent_dist": float("inf"),
+            "pred_latent_smooth_l1": float("inf"),
+            "pred_latent_cosine_distance": float("inf"),
+            "ckpt": "",
+            "selection_mode": str(
+                getattr(args, "checkpoint_selection", "best")
+            ).lower(),
+            "selection_split": "validation",
+            "selection_metric": "val_avg_dist",
+        },
+    }
+
+
+def find_existing_training_artifacts(out_dir: str | Path) -> list[Path]:
+    """Return state that must never be mixed with a fresh initialization."""
+    root = Path(out_dir)
+    candidates = []
+    for name in ("metrics.json", "validation_results.md"):
+        path = root / name
+        if path.exists():
+            candidates.append(path)
+    candidates.extend(path for path in root.glob("*.pt") if path.is_file())
+    vis_root = root / "vis"
+    if vis_root.exists():
+        candidates.extend(path for path in vis_root.rglob("*.mp4") if path.is_file())
+    return sorted(set(candidates))
+
+
+def validate_resumed_training_logs(logs: dict, args, checkpoint_epoch: int) -> None:
+    expected_identity = build_training_run_identity(args)
+    if not isinstance(logs, dict) or logs.get("run_identity") != expected_identity:
+        raise ValueError(
+            "resume metrics are not bound to the current validated cache, group "
+            "split, and training contract"
+        )
+    rows = logs.get("epochs")
+    if not isinstance(rows, list):
+        raise ValueError("resume metrics have no valid epochs list")
+    try:
+        epoch_ids = [int(row["epoch"]) for row in rows]
+    except Exception as exc:
+        raise ValueError("resume metrics contain malformed epoch rows") from exc
+    if epoch_ids != sorted(set(epoch_ids)) or any(epoch <= 0 for epoch in epoch_ids):
+        raise ValueError(
+            "resume metrics contain duplicate, non-positive, or out-of-order epochs"
+        )
+    recorded_epoch = epoch_ids[-1] if epoch_ids else 0
+    if recorded_epoch != int(checkpoint_epoch):
+        raise ValueError(
+            "resume checkpoint/metrics epoch mismatch; refusing to combine partial "
+            f"run state: checkpoint={checkpoint_epoch} metrics={recorded_epoch}"
+        )
+
+
 def unwrap_ddp_module(module):
     if isinstance(module, torch.nn.parallel.DistributedDataParallel):
         return module.module
@@ -520,25 +1020,37 @@ def load_pretrained_dense_jepa_weights(model, pretrained_weights):
 
 
 def build_dense_jepa_video_transform(img_size):
+    """Return the transform *spec* consumed by ``VideoObservationAdapter``.
+
+    The V-JEPA2 encoder subset used here does not include the upstream
+    dataset/transforms package. This data-only specification avoids an
+    import-time dependency on that optional package while preserving the exact
+    resize, crop, and normalization recipe.
+    """
     short_side_size = int(256.0 / 224 * img_size)
-    eval_transform = video_transforms.Compose(
-        [
-            video_transforms.Resize(short_side_size, interpolation="bilinear"),
-            video_transforms.CenterCrop(size=(img_size, img_size)),
-            volume_transforms.ClipToTensor(),
-            video_transforms.Normalize(
-                mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD
-            ),
-        ]
+    Resize = type("Resize", (), {})
+    CenterCrop = type("CenterCrop", (), {})
+    Normalize = type("Normalize", (), {})
+    resize = Resize()
+    resize.size = short_side_size
+    crop = CenterCrop()
+    crop.size = (img_size, img_size)
+    normalize = Normalize()
+    normalize.mean = IMAGENET_DEFAULT_MEAN
+    normalize.std = IMAGENET_DEFAULT_STD
+    return SimpleNamespace(
+        transforms=[resize, crop, normalize]
     )
-    return eval_transform
 
 
 def load_dense_jepa_encoder(pt_model_path=None):
     if pt_model_path is None:
         pt_model_path = resolve_dense_jepa_checkpoint()
     img_size = 256
-    model_pt = vit_large_rope(img_size=(img_size, img_size), num_frames=64)
+    # ThinkJEPA encodes the observed and target 32-frame clips independently.
+    # V-JEPA2 uses RoPE, so the pretrained weights are compatible with this
+    # shorter temporal grid.
+    model_pt = vit_large_rope(img_size=(img_size, img_size), num_frames=32)
     model_pt.cuda().eval()
     load_pretrained_dense_jepa_weights(model_pt, pt_model_path)
     pt_video_transform = build_dense_jepa_video_transform(img_size=img_size)
@@ -546,12 +1058,87 @@ def load_dense_jepa_encoder(pt_model_path=None):
 
 
 def encode_dense_jepa_video(video, model_pt):
+    """Encode one self-contained clip without inventing pseudo time steps.
+
+    V-JEPA2's Conv3d patch embed has temporal stride/tubelet size 2.  A
+    32-frame clip therefore yields 16 temporal positions with 16x16 spatial
+    patches, i.e. ``[B, 16, 256, D]``.  The old code reshaped those tokens to
+    ``[B, 32, 128, D]`` and silently mixed the spatial and temporal axes.
+    """
     with torch.no_grad():
         B, T, C, H, W = video.shape
         video = video.permute(0, 2, 1, 3, 4)
         out = model_pt(video)
-        out = out.contiguous().view(B, T, -1, out.shape[-1])  # [B, T, P, D]
+        tubelet_size = int(getattr(model_pt, "tubelet_size", 2))
+        patch_size = int(getattr(model_pt, "patch_size", 16))
+        if T % tubelet_size != 0:
+            raise ValueError(
+                f"V-JEPA clip length {T} is not divisible by tubelet_size={tubelet_size}"
+            )
+        temporal_tokens = T // tubelet_size
+        spatial_tokens = (H // patch_size) * (W // patch_size)
+        expected_tokens = temporal_tokens * spatial_tokens
+        if out.ndim != 3 or int(out.shape[1]) != expected_tokens:
+            raise ValueError(
+                "Unexpected V-JEPA token layout: "
+                f"output={tuple(out.shape)} expected N={expected_tokens} "
+                f"for T={T}, H={H}, W={W}, tubelet={tubelet_size}, patch={patch_size}"
+            )
+        out = out.contiguous().view(
+            B, temporal_tokens, spatial_tokens, out.shape[-1]
+        )
     return out
+
+
+def align_vjepa_tubelets_to_frames(features, frame_count, tubelet_size=2):
+    """Explicitly align tubelet features to per-frame supervision.
+
+    Repeating a complete spatial token grid is explicit and deterministic. It
+    replaces the former implicit reshape that split a 256-patch grid into two
+    unrelated 128-token pseudo frames.
+    """
+    if features.ndim != 4:
+        raise ValueError(f"expected [B,T_latent,P,D], got {tuple(features.shape)}")
+    tubelet_size = int(tubelet_size)
+    if tubelet_size <= 0:
+        raise ValueError(f"tubelet_size must be positive, got {tubelet_size}")
+    aligned = features.repeat_interleave(tubelet_size, dim=1)
+    if int(aligned.shape[1]) < int(frame_count):
+        raise ValueError(
+            f"only {aligned.shape[1]} aligned frames for requested {frame_count}"
+        )
+    return aligned[:, : int(frame_count), ...].contiguous()
+
+
+def encode_causal_vjepa_windows(
+    video,
+    model_pt,
+    *,
+    past_frames=32,
+    future_frames=32,
+    align_to_frames=True,
+):
+    """Run two independent encoder forwards for observed and target clips."""
+    past_frames = int(past_frames)
+    future_frames = int(future_frames)
+    required = past_frames + future_frames
+    if video.ndim != 5 or int(video.shape[1]) < required:
+        raise ValueError(
+            f"expected [B,T,C,H,W] with T>={required}, got {tuple(video.shape)}"
+        )
+    observed_video = video[:, :past_frames, ...].contiguous()
+    target_video = video[:, past_frames:required, ...].contiguous()
+    observed = encode_dense_jepa_video(observed_video, model_pt)
+    target = encode_dense_jepa_video(target_video, model_pt)
+    if align_to_frames:
+        tubelet_size = int(getattr(model_pt, "tubelet_size", 2))
+        observed = align_vjepa_tubelets_to_frames(
+            observed, past_frames, tubelet_size=tubelet_size
+        )
+        target = align_vjepa_tubelets_to_frames(
+            target, future_frames, tubelet_size=tubelet_size
+        )
+    return observed, target
 
 
 def predict_trajectory_from_latents(cls_model, out_patch_features_pt, ref_pts=None, n_tokens=128):
@@ -593,6 +1180,35 @@ def distributed_average_from_sum_count(sum_x: float, count_x: int, *, ddp: bool)
     return total_sum / total_count
 
 
+def distributed_sum_int(value: int, *, ddp: bool) -> int:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tensor = torch.tensor([int(value)], dtype=torch.int64, device=device)
+    if ddp and torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    return int(tensor.item())
+
+
+class DistributedEvalSampler(torch.utils.data.Sampler):
+    """Shard evaluation without padding or duplicating validation samples."""
+
+    def __init__(self, dataset, *, num_replicas: int, rank: int):
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self):
+        total = len(self.dataset)
+        if self.rank >= total:
+            return 0
+        return (total - 1 - self.rank) // self.num_replicas + 1
+
+    def set_epoch(self, epoch: int) -> None:
+        del epoch
+
+
 def project_camera_points_to_world(xyz_cam, cam_ext):
     B, T, J, _ = xyz_cam.shape
     ones = torch.ones_like(xyz_cam[..., :1])
@@ -604,10 +1220,6 @@ def project_camera_points_to_world(xyz_cam, cam_ext):
 
 
 # ================= cache helpers =================
-def _is_fatal_camera_geometry_error(exc: Exception) -> bool:
-    return isinstance(exc, CameraGeometryLoadError) or "[CAM-INVALID]" in str(exc)
-
-
 def _identity_transform(x):
     return x
 
@@ -638,8 +1250,7 @@ def resolve_cache_preload_policy(args) -> bool:
     explicit = getattr(args, "preload_cache_to_memory", None)
     if explicit is not None:
         return bool(explicit)
-    value = getattr(args, "cache_dir", None)
-    return isinstance(value, str) and value and is_huggingface_cache_path(value)
+    return False
 
 
 def preload_npz_archives(cache_root: str):
@@ -767,10 +1378,14 @@ def pad_or_truncate_guidance_tensor(x: torch.Tensor, target_len: int, pad_value:
         raise ValueError(f"Expected [L,S,D], got {tuple(x.shape)}")
     L, S, D = x.shape
     tgt = int(target_len)
-    if S >= tgt:
-        y = x[:, :tgt, :].contiguous()
-        mask = torch.ones((L, tgt), dtype=torch.bool)
-        return y, mask, S
+    if S > tgt:
+        raise ValueError(
+            f"VLM guidance length {S} exceeds configured capacity {tgt}; "
+            "increase --vlm_pad_old_to/--vlm_pad_new_to instead of silently "
+            "discarding observed-video or prompt tokens"
+        )
+    if S == tgt:
+        return x.contiguous(), torch.ones((L, tgt), dtype=torch.bool), S
     y = x.new_full((L, tgt, D), pad_value)
     y[:, :S, :] = x
     mask = torch.zeros((L, tgt), dtype=torch.bool)
@@ -791,8 +1406,13 @@ def pad_or_truncate_token_ids(
     ids = ids.to(torch.int32).contiguous()
     S = int(ids.numel())
     tgt = int(target_len)
-    if S >= tgt:
-        return ids[:tgt].contiguous(), S
+    if S > tgt:
+        raise ValueError(
+            f"generated token length {S} exceeds configured capacity {tgt}; "
+            "increase --vlm_pad_new_to instead of silently truncating token ids"
+        )
+    if S == tgt:
+        return ids.contiguous(), S
     out = ids.new_full((tgt,), int(pad_id))
     out[:S] = ids
     return out.contiguous(), S
@@ -805,6 +1425,8 @@ def load_thinker_guidance_from_npz_batch(
     pad_new_to: int,
     preloaded_archives: dict | None = None,
 ):
+    from egodex.trajectory_dataset import validate_causal_cache_payload
+
     samples = []
     for p in npz_list:
         item = {
@@ -818,28 +1440,31 @@ def load_thinker_guidance_from_npz_batch(
             "token_ids_len": 0,
             "layers": None,
         }
-        if p is None or (not os.path.exists(p)):
+        if p is None:
             samples.append(item)
             continue
-        try:
-            if preloaded_archives is not None:
-                payload = preloaded_archives.get(p, {})
-                old = payload.get("vlm_old", None)
-                new = payload.get("vlm_new", None)
-                token_ids = payload.get("token_ids", None)
-                layers = payload.get("layers", None)
-            else:
-                with np.load(p, allow_pickle=False) as z:
-                    old = z["vlm_old"] if "vlm_old" in z else None
-                    new = z["vlm_new"] if "vlm_new" in z else None
-                    token_ids = z["token_ids"] if "token_ids" in z else None
-                    layers = z["layers"] if "layers" in z else None
+        if preloaded_archives is not None and p in preloaded_archives:
+            payload = dict(preloaded_archives.get(p, {}))
+        elif not os.path.exists(p):
+            samples.append(item)
+            continue
+        else:
+            with np.load(p, allow_pickle=False) as z:
+                payload = {key: z[key] for key in z.files}
+
+        old = payload.get("vlm_old", None)
+        new = payload.get("vlm_new", None)
+        token_ids = payload.get("token_ids", None)
+        layers = payload.get("layers", None)
+        if old is not None or new is not None:
+            # The combined schema proves that Qwen saw exactly the same raw
+            # observed frames as the independently encoded JEPA input.
+            validate_causal_cache_payload(payload, path=str(p))
 
             if old is not None:
-                t_old = torch.from_numpy(old)
+                t_old = _cache_array_to_float_tensor(old)
                 if t_old.dim() == 4:  # [L,T,S,D] -> [L,S,D]
                     t_old = t_old[:, -1, :, :]
-                t_old = t_old.float().contiguous()
                 old_pad, old_mask, old_len = pad_or_truncate_guidance_tensor(
                     t_old, target_len=pad_old_to, pad_value=0.0
                 )
@@ -848,10 +1473,9 @@ def load_thinker_guidance_from_npz_batch(
                 item["vlm_old_len"] = int(old_len)
 
             if new is not None:
-                t_new = torch.from_numpy(new)
+                t_new = _cache_array_to_float_tensor(new)
                 if t_new.dim() == 4:  # [L,T,S,D] -> [L,S,D]
                     t_new = t_new[:, -1, :, :]
-                t_new = t_new.float().contiguous()
                 new_pad, new_mask, new_len = pad_or_truncate_guidance_tensor(
                     t_new, target_len=pad_new_to, pad_value=0.0
                 )
@@ -860,7 +1484,7 @@ def load_thinker_guidance_from_npz_batch(
                 item["vlm_new_len"] = int(new_len)
 
             if token_ids is not None:
-                t_ids = torch.from_numpy(token_ids)
+                t_ids = torch.from_numpy(np.asarray(token_ids))
                 if t_ids.dim() > 1:
                     t_ids = t_ids.reshape(-1)
                 t_ids_pad, t_ids_len = pad_or_truncate_token_ids(
@@ -870,10 +1494,7 @@ def load_thinker_guidance_from_npz_batch(
                 item["token_ids_len"] = int(t_ids_len)
 
             if layers is not None:
-                item["layers"] = torch.from_numpy(layers).to(torch.int32).contiguous()
-
-        except Exception:
-            pass
+                item["layers"] = torch.from_numpy(np.asarray(layers)).to(torch.int32).contiguous()
         samples.append(item)
 
     def _first_shape(key):
@@ -951,14 +1572,11 @@ def ensure_thinker_guidance_payload(
     path_cache,
     preloaded_archives=None,
 ):
-    if not bool(getattr(args, "thinkjepa_use_vlm_merge", True)):
-        return extras
-
     # Return immediately if usable extras are already available
     if isinstance(extras, dict) and (
         extras.get("vlm_old", None) is not None or extras.get("vlm_new", None) is not None
     ):
-        return apply_guidance_ablation_policy(extras, args)
+        return apply_guidance_policy(extras, args)
 
     if not bool(getattr(args, "thinkjepa_use_cache_ext", True)):
         return extras
@@ -979,13 +1597,13 @@ def ensure_thinker_guidance_payload(
     loaded = load_thinker_guidance_from_npz_batch(
         npz_list=npz_list,
         device=device,
-        pad_old_to=int(getattr(args, "vlm_pad_old_to", 480)),
-        pad_new_to=int(getattr(args, "vlm_pad_new_to", 15)),
+        pad_old_to=int(getattr(args, "vlm_pad_old_to", 1280)),
+        pad_new_to=int(getattr(args, "vlm_pad_new_to", 16)),
         preloaded_archives=preloaded_archives,
     )
     if loaded is None:
         return extras
-    return apply_guidance_ablation_policy(loaded, args)
+    return apply_guidance_policy(loaded, args)
 
 
 def _ensure_thinkjepa_extras(
@@ -1007,76 +1625,6 @@ def _ensure_thinkjepa_extras(
         path_cache=path_cache,
         preloaded_archives=preloaded_archives,
     )
-
-
-def select_pyramid_guidance_tensor(x, args):
-    if x is None:
-        return None
-    mode = str(getattr(args, "thinkjepa_vlm_layer_selector", "last")).lower()
-    idx = int(getattr(args, "thinkjepa_vlm_layer_index", -1))
-    if x.dim() == 4:
-        # [B,L,S,D]
-        L = x.size(1)
-        if mode == "all":
-            return x
-        if mode == "mid":
-            mid = L // 2
-            return x[:, mid : mid + 1, ...]
-        if mode == "index":
-            j = idx if idx >= 0 else (L + idx)
-            j = max(0, min(L - 1, j))
-            return x[:, j : j + 1, ...]
-        return x[:, -1:, ...]
-    if x.dim() == 3:
-        # [L,S,D]
-        L = x.size(0)
-        if mode == "all":
-            return x
-        if mode == "mid":
-            mid = L // 2
-            return x[mid : mid + 1, ...]
-        if mode == "index":
-            j = idx if idx >= 0 else (L + idx)
-            j = max(0, min(L - 1, j))
-            return x[j : j + 1, ...]
-        return x[-1:, ...]
-    return x
-
-
-def select_pyramid_guidance_mask(m, args):
-    if m is None:
-        return None
-    mode = str(getattr(args, "thinkjepa_vlm_layer_selector", "last")).lower()
-    idx = int(getattr(args, "thinkjepa_vlm_layer_index", -1))
-    if m.dim() == 4:
-        m = m.any(dim=-1)
-    if m.dim() == 3:
-        # [B,L,S]
-        L = m.size(1)
-        if mode == "all":
-            return m
-        if mode == "mid":
-            mid = L // 2
-            return m[:, mid : mid + 1, ...]
-        if mode == "index":
-            j = idx if idx >= 0 else (L + idx)
-            j = max(0, min(L - 1, j))
-            return m[:, j : j + 1, ...]
-        return m[:, -1:, ...]
-    if m.dim() == 2:
-        # [L,S]
-        L = m.size(0)
-        if mode == "all":
-            return m
-        if mode == "mid":
-            mid = L // 2
-            return m[mid : mid + 1, ...]
-        if mode == "index":
-            j = idx if idx >= 0 else (L + idx)
-            j = max(0, min(L - 1, j))
-            return m[j : j + 1, ...]
-        return m[-1:, ...]
-    return m
 
 
 def parse_token_id_set(spec) -> set[int]:
@@ -1294,31 +1842,12 @@ def filter_reasoning_tokens_from_guidance(extras, args):
     return out
 
 
-def apply_guidance_ablation_policy(extras, args):
+def apply_guidance_policy(extras, args):
     if extras is None or not isinstance(extras, dict):
         return extras
     out = dict(extras)
-    src = str(getattr(args, "thinkjepa_vlm_source", "both")).lower()
-    if src == "old":
-        out["vlm_new"] = None
-        out["vlm_new_mask"] = None
-        out["vlm_new_len"] = None
-    elif src == "new":
-        out["vlm_old"] = None
-        out["vlm_old_mask"] = None
-        out["vlm_old_len"] = None
-    elif src == "none":
-        out["vlm_old"] = None
-        out["vlm_new"] = None
-        out["vlm_old_mask"] = None
-        out["vlm_new_mask"] = None
-        out["vlm_old_len"] = None
-        out["vlm_new_len"] = None
-
-    out["vlm_old"] = select_pyramid_guidance_tensor(out.get("vlm_old", None), args)
-    out["vlm_new"] = select_pyramid_guidance_tensor(out.get("vlm_new", None), args)
-    out["vlm_old_mask"] = select_pyramid_guidance_mask(out.get("vlm_old_mask", None), args)
-    out["vlm_new_mask"] = select_pyramid_guidance_mask(out.get("vlm_new_mask", None), args)
+    # ThinkJEPA consumes both streams and every cached VLM layer.
+    # Reasoning-token filtering remains an explicitly recorded ThinkJEPA option.
     out = filter_reasoning_tokens_from_guidance(out, args)
     return out
 
@@ -1326,9 +1855,7 @@ def apply_guidance_ablation_policy(extras, args):
 def build_thinkjepa_guidance_inputs(extras, args, device):
     if extras is None:
         return None
-    if not bool(getattr(args, "thinkjepa_use_vlm_merge", True)):
-        return None
-    extras = apply_guidance_ablation_policy(extras, args)
+    extras = apply_guidance_policy(extras, args)
 
     def _to_tensor(x):
         if x is None:
@@ -1339,29 +1866,33 @@ def build_thinkjepa_guidance_inputs(extras, args, device):
             return torch.from_numpy(x).to(device).float()
         raise TypeError(f"Unsupported type {type(x)} for VLM features")
 
-    def _collapse_feat(x):
+    def _preserve_per_sample_feat(x):
         if x is None:
             return None
         x = _to_tensor(x)
-        if x.dim() == 4:
-            x = x.mean(dim=0, keepdim=False)
+        if x.dim() not in (3, 4):
+            raise ValueError(
+                f"VLM guidance must be [L,S,D] or [B,L,S,D], got {tuple(x.shape)}"
+            )
         return x
 
-    def _collapse_mask(m):
+    def _preserve_per_sample_mask(m):
         if m is None:
             return None
         m = _to_tensor(m)
         if m.dim() == 4:
             m = m.any(dim=-1)
-        if m.dim() == 3:
-            m = m.any(dim=0)
-        return m
+        if m.dim() not in (2, 3):
+            raise ValueError(
+                f"VLM mask must be [L,S] or [B,L,S], got {tuple(m.shape)}"
+            )
+        return m.to(dtype=torch.bool)
 
     return {
-        "vlm_old": _collapse_feat(extras.get("vlm_old", None)),
-        "vlm_new": _collapse_feat(extras.get("vlm_new", None)),
-        "vlm_old_mask": _collapse_mask(extras.get("vlm_old_mask", None)),
-        "vlm_new_mask": _collapse_mask(extras.get("vlm_new_mask", None)),
+        "vlm_old": _preserve_per_sample_feat(extras.get("vlm_old", None)),
+        "vlm_new": _preserve_per_sample_feat(extras.get("vlm_new", None)),
+        "vlm_old_mask": _preserve_per_sample_mask(extras.get("vlm_old_mask", None)),
+        "vlm_new_mask": _preserve_per_sample_mask(extras.get("vlm_new_mask", None)),
     }
 
 
@@ -1381,12 +1912,18 @@ def write_markdown_experiment_report(
     best = logs.get("best", {}) if isinstance(logs, dict) else {}
 
     lines = []
+    if bool(getattr(args, "smoke_only", False)):
+        lines.append("# SMOKE TEST ONLY — NOT A REPORTABLE RESULT")
+        lines.append("")
+        lines.append(
+            "This run used intentionally truncated train/eval loops and must not be "
+            "used in a paper table, model selection, or final evaluation."
+        )
+        lines.append("")
     lines.append("# Train/Eval Summary")
     lines.append("")
     lines.append("## Run Config")
     lines.append("")
-    lines.append(f"- `data_dir`: `{getattr(args, 'data_dir', '')}`")
-    lines.append(f"- `cache_dir`: `{getattr(args, 'cache_dir', '')}`")
     lines.append(f"- `backbone`: `{getattr(args, 'backbone', '')}`")
     lines.append(f"- `predictor`: `{getattr(args, 'predictor', '')}`")
     lines.append(f"- `epochs`: `{getattr(args, 'epochs', '')}`")
@@ -1394,12 +1931,26 @@ def write_markdown_experiment_report(
     lines.append(f"- `trajmode`: `{getattr(args, 'trajmode', '')}`")
     lines.append(f"- `past_T`: `{getattr(args, 'past_T', '')}`")
     lines.append(f"- `future_T`: `{getattr(args, 'future_T', '')}`")
-    lines.append(f"- `train_ratio`: `{getattr(args, 'train_ratio', '')}`")
-    lines.append(f"- `split_seed`: `{getattr(args, 'split_seed', '')}`")
-    lines.append(f"- `train_manifest`: `{getattr(args, 'train_manifest', '')}`")
-    lines.append(f"- `test_manifest`: `{getattr(args, 'test_manifest', '')}`")
+    lines.append(
+        f"- `checkpoint_selection`: `{getattr(args, 'checkpoint_selection', '')}`"
+    )
+    lines.append("- `held_out_test_manifest`: `not configured`")
     lines.append(f"- `train_size`: `{train_size}`")
-    lines.append(f"- `test_size`: `{test_size}`")
+    lines.append(f"- `validation_size`: `{test_size}`")
+    run_identity = logs.get("run_identity", {}) if isinstance(logs, dict) else {}
+    for key in (
+        "supervision_manifest_stat_fingerprint",
+        "supervision_file_count",
+        "cache_config_fingerprint",
+        "cache_validation_report_sha256",
+        "split_meta_sha256",
+        "train_manifest_sha256",
+        "test_manifest_sha256",
+        "training_contract_sha256",
+    ):
+        value = run_identity.get(key, "")
+        if value:
+            lines.append(f"- `{key}`: `{value}`")
     if artifact_paths:
         for key, value in artifact_paths.items():
             if value:
@@ -1408,22 +1959,43 @@ def write_markdown_experiment_report(
 
     if len(epochs) > 0:
         last = epochs[-1]
-        lines.append("## Best Validation")
+        selection_mode = str(best.get("selection_mode", "")).lower()
+        if selection_mode in {"best", "validation"}:
+            lines.append("## Validation-Selected Checkpoint")
+        else:
+            lines.append("## Final-Epoch Checkpoint")
         lines.append("")
-        lines.append(f"- `best_epoch`: `{best.get('epoch', 'NA')}`")
-        lines.append(f"- `best_val_avg_dist (ADE)`: `{best.get('ade', 'NA')}`")
-        lines.append(f"- `best_val_loss`: `{best.get('loss', 'NA')}`")
-        lines.append(f"- `best_val_pred_loss`: `{best.get('pred_loss', 'NA')}`")
+        lines.append(f"- `selection_mode`: `{best.get('selection_mode', 'NA')}`")
+        lines.append(f"- `selection_split`: `{best.get('selection_split', 'NA')}`")
+        lines.append(f"- `selection_metric`: `{best.get('selection_metric', 'NA')}`")
+        lines.append(f"- `selected_epoch`: `{best.get('epoch', 'NA')}`")
+        lines.append(f"- `selected_epoch_val_avg_dist (ADE)`: `{best.get('ade', 'NA')}`")
         lines.append(
-            f"- `best_val_pred_latent_dist`: `{best.get('pred_latent_dist', 'NA')}`"
+            f"- `selected_epoch_val_final_dist (FDE)`: `{best.get('fde', 'NA')}`"
+        )
+        lines.append(f"- `selected_epoch_val_loss`: `{best.get('loss', 'NA')}`")
+        lines.append(f"- `selected_epoch_val_pred_loss`: `{best.get('pred_loss', 'NA')}`")
+        lines.append(
+            f"- `selected_epoch_val_pred_latent_dist`: `{best.get('pred_latent_dist', 'NA')}`"
         )
         lines.append(
-            f"- `best_val_pred_latent_smooth_l1`: `{best.get('pred_latent_smooth_l1', 'NA')}`"
+            f"- `selected_epoch_val_pred_latent_smooth_l1`: `{best.get('pred_latent_smooth_l1', 'NA')}`"
         )
         lines.append(
-            f"- `best_val_pred_latent_cosine_distance`: `{best.get('pred_latent_cosine_distance', 'NA')}`"
+            f"- `selected_epoch_val_pred_latent_cosine_distance`: `{best.get('pred_latent_cosine_distance', 'NA')}`"
         )
-        lines.append(f"- `best_ckpt`: `{best.get('ckpt', 'NA')}`")
+        lines.append(f"- `selected_ckpt`: `{best.get('ckpt', 'NA')}`")
+        if selection_mode in {"best", "validation"}:
+            lines.append(
+                "- This checkpoint was selected by validation ADE; its FDE is "
+                "the FDE from the same selected epoch."
+            )
+            lines.append("- No independent held-out test manifest is configured.")
+        else:
+            lines.append(
+                "- This is the final-epoch checkpoint; validation was not used "
+                "for model selection."
+            )
         lines.append("")
         lines.append("## Last Epoch")
         lines.append("")
@@ -1493,25 +2065,180 @@ def write_markdown_experiment_report(
     write_text_file("\n".join(lines), md_path)
 
 
-def stack_cached_feature_tensors(npz_paths, device, preloaded_archives: dict | None = None):
-    """Stack vjepa_feats from multiple samples into [B, T, P, D]; supports bf16(uint16 view)."""
+def _cache_array_to_float_tensor(value):
+    if isinstance(value, torch.Tensor):
+        tensor = value
+        if tensor.dtype == torch.uint16:
+            tensor = tensor.view(torch.bfloat16)
+        return tensor.float().contiguous()
+    array = np.asarray(value)
+    tensor = torch.from_numpy(array)
+    if tensor.dtype == torch.uint16:
+        tensor = tensor.view(torch.bfloat16)
+    return tensor.float().contiguous()
+
+
+def _all_metadata_values_equal(value, expected) -> bool:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return False
+        if isinstance(expected, str):
+            return False
+        return bool(torch.all(value.detach().cpu() == expected).item())
+    if isinstance(value, np.ndarray):
+        return bool(value.size > 0 and np.all(value == expected))
+    if isinstance(value, (list, tuple)):
+        return bool(value) and all(str(item) == str(expected) for item in value)
+    return str(value) == str(expected)
+
+
+def assemble_causal_vjepa_features_from_extras(extras, args, device):
+    """Validate and frame-align independently encoded cache tensors."""
+    if not isinstance(extras, dict):
+        return None
+    observed = extras.get("vjepa_input_feats")
+    target = extras.get("vjepa_target_feats")
+    if observed is not None or target is not None:
+        if observed is None or target is None:
+            raise ValueError(
+                "causal cache batch must provide both vjepa_input_feats and vjepa_target_feats"
+            )
+        if not _all_metadata_values_equal(extras.get("cache_schema_version"), 2):
+            raise ValueError("causal cache batch has missing or unsupported schema version")
+        if not _all_metadata_values_equal(
+            extras.get("cache_schema_name"), "thinkjepa.causal_split.v2"
+        ):
+            raise ValueError("causal cache batch has missing or unsupported schema name")
+        if not _all_metadata_values_equal(
+            extras.get("vlm_observation_policy"), "observed_past_exact_frames"
+        ):
+            raise ValueError("cached VLM guidance is not proven observation-only")
+
+        observed = _cache_array_to_float_tensor(observed)
+        target = _cache_array_to_float_tensor(target)
+        if observed.ndim == 3:
+            observed = observed.unsqueeze(0)
+        if target.ndim == 3:
+            target = target.unsqueeze(0)
+        if observed.ndim != 4 or target.ndim != 4:
+            raise ValueError(
+                f"expected split V-JEPA [B,T_latent,P,D], got {observed.shape} and {target.shape}"
+            )
+        if observed.shape[0] != target.shape[0] or observed.shape[2:] != target.shape[2:]:
+            raise ValueError(
+                f"split V-JEPA layouts do not match: {observed.shape} vs {target.shape}"
+            )
+
+        observed_ids = extras.get("vjepa_input_frame_indices")
+        target_ids = extras.get("vjepa_target_frame_indices")
+        vlm_ids = extras.get("vlm_observation_frame_indices")
+        if not all(isinstance(x, torch.Tensor) for x in (observed_ids, target_ids, vlm_ids)):
+            raise ValueError("causal cache batch is missing exact source frame indices")
+        if observed_ids.ndim == 1:
+            observed_ids = observed_ids.unsqueeze(0)
+            target_ids = target_ids.unsqueeze(0)
+            vlm_ids = vlm_ids.unsqueeze(0)
+        if not torch.equal(observed_ids.cpu(), vlm_ids.cpu()):
+            raise ValueError("VLM and V-JEPA cache branches used different observed frames")
+        for row in range(observed_ids.shape[0]):
+            if set(observed_ids[row].cpu().tolist()) & set(target_ids[row].cpu().tolist()):
+                raise ValueError("observed and target raw frame sets overlap in cache batch")
+        cached_past_frames = int(observed_ids.shape[-1])
+        cached_future_frames = int(target_ids.shape[-1])
+        if (
+            int(args.past_T) != cached_past_frames
+            or int(args.future_T) != cached_future_frames
+        ):
+            raise ValueError(
+                "training windows do not match causal cache provenance: "
+                f"args={args.past_T}+{args.future_T} "
+                f"cache={cached_past_frames}+{cached_future_frames}"
+            )
+
+        tubelet_meta = extras.get("vjepa_tubelet_size", 2)
+        if isinstance(tubelet_meta, torch.Tensor):
+            unique_tubelets = torch.unique(tubelet_meta.detach().cpu())
+            if unique_tubelets.numel() != 1:
+                raise ValueError("mixed V-JEPA tubelet sizes in one cache batch")
+            tubelet_size = int(unique_tubelets.item())
+        else:
+            tubelet_size = int(tubelet_meta)
+        if (
+            int(observed.shape[1]) * tubelet_size != cached_past_frames
+            or int(target.shape[1]) * tubelet_size != cached_future_frames
+        ):
+            raise ValueError(
+                "V-JEPA tubelet lengths do not exactly cover the cached raw-frame windows"
+            )
+        observed = align_vjepa_tubelets_to_frames(
+            observed, int(args.past_T), tubelet_size=tubelet_size
+        )
+        target = align_vjepa_tubelets_to_frames(
+            target, int(args.future_T), tubelet_size=tubelet_size
+        )
+        return torch.cat([observed, target], dim=1).to(device, non_blocking=True)
+
+    if extras.get("vjepa_feats") is not None:
+        raise ValueError(
+            "vjepa_feats has no split-encoding provenance; rebuild the cache with "
+            "independent vjepa_input_feats and vjepa_target_feats"
+        )
+    return None
+
+
+def stack_cached_feature_tensors(
+    npz_paths,
+    device,
+    preloaded_archives: dict | None = None,
+    *,
+    past_frames=32,
+    future_frames=32,
+):
+    """Stack validated split V-JEPA caches into frame-aligned ``[B,T,P,D]``."""
     feats = []
     for p in npz_paths:
         if preloaded_archives is not None:
             payload = preloaded_archives.get(p, None)
-            if payload is None or "vjepa_feats" not in payload:
-                raise KeyError(f"{p} has no key 'vjepa_feats'")
-            f = payload["vjepa_feats"]
+            if payload is None:
+                raise KeyError(f"no preloaded archive for {p}")
         else:
             with np.load(p, allow_pickle=False, mmap_mode="r") as z:
-                if "vjepa_feats" not in z:
-                    raise KeyError(f"{p} has no key 'vjepa_feats'")
-                f = z["vjepa_feats"]
-        x = torch.from_numpy(f)
-        if x.dtype == torch.uint16:
-            x = x.view(torch.bfloat16)
-            x = x.float()
-            feats.append(x)
+                payload = {key: z[key] for key in z.files}
+
+        if "vjepa_input_feats" in payload or "vjepa_target_feats" in payload:
+            from egodex.trajectory_dataset import validate_causal_cache_payload
+
+            validate_causal_cache_payload(payload, path=str(p))
+            tubelet_size = int(np.asarray(payload.get("vjepa_tubelet_size", 2)).reshape(-1)[0])
+            observed = _cache_array_to_float_tensor(payload["vjepa_input_feats"]).unsqueeze(0)
+            target = _cache_array_to_float_tensor(payload["vjepa_target_feats"]).unsqueeze(0)
+            cached_past_frames = int(
+                np.asarray(payload["vjepa_input_frame_indices"]).reshape(-1).size
+            )
+            cached_future_frames = int(
+                np.asarray(payload["vjepa_target_frame_indices"]).reshape(-1).size
+            )
+            if (
+                int(past_frames) != cached_past_frames
+                or int(future_frames) != cached_future_frames
+                or int(observed.shape[1]) * tubelet_size != cached_past_frames
+                or int(target.shape[1]) * tubelet_size != cached_future_frames
+            ):
+                raise ValueError(
+                    f"training window {past_frames}+{future_frames} does not exactly "
+                    f"match causal cache provenance {cached_past_frames}+{cached_future_frames}"
+                )
+            observed = align_vjepa_tubelets_to_frames(
+                observed, past_frames, tubelet_size=tubelet_size
+            )
+            target = align_vjepa_tubelets_to_frames(
+                target, future_frames, tubelet_size=tubelet_size
+            )
+            feats.append(torch.cat([observed, target], dim=1).squeeze(0))
+        else:
+            raise ValueError(
+                f"{p} has no validated split V-JEPA fields; legacy caches are disabled"
+            )
     return torch.stack(feats, dim=0).to(device, non_blocking=True)  # [B,T,P,D]
 
 
@@ -1572,10 +2299,17 @@ def try_load_cached_dense_jepa_features(
 
     try:
         return stack_cached_feature_tensors(
-            npz_list, device=device, preloaded_archives=preloaded_archives
+            npz_list,
+            device=device,
+            preloaded_archives=preloaded_archives,
+            past_frames=int(getattr(args, "past_T", 32)),
+            future_frames=int(getattr(args, "future_T", 32)),
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError(
+            "resolved V-JEPA cache archives failed causal validation; refusing "
+            f"an unvalidated fallback: {npz_list}"
+        ) from exc
 
 
 def parse_batch_extras_and_paths(batch):
@@ -1841,7 +2575,7 @@ def render_bimanual_rollout_panel(
     return np.stack(frames_all, axis=0)  # [M_total, H, 3W, C]
 
 
-# ===== helper funcs for official predictor =====
+# ===== predictor token helpers =====
 def split_context_and_future_windows(T, past_T, future_T):
     past_T = min(past_T, T)
     if future_T is None:
@@ -1858,11 +2592,6 @@ def stride_time_tensor(x, stride):
     if x.dim() < 2:
         return x
     return x[:, :: int(stride), ...].contiguous()
-
-
-def build_future_causal_mask(T, device):
-    m = torch.ones(T, T, dtype=torch.bool, device=device).tril()
-    return m
 
 
 def flatten_temporal_patch_tokens(x_bt_p_d):
@@ -1884,10 +2613,96 @@ def repeat_indices_for_batch(idx_1d, B, device):
 
 
 def main(args):
-    configure_huggingface_cache_dirs()
+    requested_predictor = str(getattr(args, "predictor", "thinkjepa")).lower()
+    if requested_predictor != "thinkjepa":
+        raise ValueError("this training entrypoint supports predictor=thinkjepa")
+    # Keep the registered ThinkJEPA protocol fixed when ``main`` is called
+    # programmatically.
+    args.predictor = "thinkjepa"
+    args.use_npz_cache = True
+    args.skip_vjepa = True
+    args.temporal_causal_attn = True
+    args.thinkjepa_use_vlm_merge = True
+    args.thinkjepa_use_cache_ext = True
+    args.thinkjepa_vlm_source = "both"
+    args.thinkjepa_vlm_layer_selector = "all"
+    args.thinkjepa_vlm_layer_index = -1
+    args.thinkjepa_vlm_cond_mode = "film"
+    args.joint_pred = True
+    args.optimize_together_downstream = True
+    args.skip_nonfinite_loss = False
+    args.camera_mode = "egodex"
+
+    if not str(getattr(args, "data_dir", "")).strip():
+        raise ValueError("--data_dir must explicitly name the local supervision root")
+    if bool(getattr(args, "use_npz_cache", False)) and not str(
+        getattr(args, "cache_dir", "")
+    ).strip():
+        raise ValueError("--cache_dir must explicitly name the causal feature-cache root")
+    if not all(
+        str(getattr(args, name, "") or "").strip()
+        for name in ("train_manifest", "test_manifest", "split_meta")
+    ):
+        raise ValueError(
+            "ThinkJEPA training requires train/validation manifests and split metadata "
+            "from the validated group-aware portable bundle"
+        )
+    if any(
+        str(value).startswith("hf://")
+        for value in (
+            getattr(args, "data_dir", ""),
+            getattr(args, "cache_dir", ""),
+        )
+    ):
+        raise ValueError(
+            "training requires explicit local supervision/cache roots; "
+            "remote Hugging Face references are disabled"
+        )
+
+    requested_hf_home = str(os.environ.get("HF_HOME", "")).strip()
+    if not requested_hf_home:
+        cache_reference = str(
+            getattr(args, "cache_dir", "") or getattr(args, "data_dir", "")
+        )
+        requested_hf_home = str(
+            Path(cache_reference).expanduser().resolve().parent / "hf_home"
+        )
+    hf_home = Path(requested_hf_home).expanduser().resolve()
+    user_home = Path.home().resolve()
+    if hf_home == user_home or user_home in hf_home.parents:
+        raise ValueError(
+            f"HF_HOME must be outside the user home for training, got {hf_home}"
+        )
+    configure_huggingface_cache_dirs(str(hf_home))
+
     args.data_dir = resolve_egodex_data_reference(str(args.data_dir))
     if getattr(args, "cache_dir", None):
         args.cache_dir = resolve_egodex_data_reference(str(args.cache_dir))
+    if (
+        bool(getattr(args, "use_npz_cache", False))
+        and os.path.realpath(str(args.data_dir)) == os.path.realpath(str(args.cache_dir))
+    ):
+        raise ValueError(
+            "safe cache mode requires separate supervision --data_dir and feature "
+            "--cache_dir roots; do not point training at the legacy mixed cache"
+        )
+    if (
+        bool(getattr(args, "use_npz_cache", False))
+        and (
+            int(getattr(args, "past_T", 32)) != 32
+            or int(getattr(args, "future_T", 32)) != 32
+        )
+    ):
+        raise ValueError(
+            "causal cache schema v2 is bound to past_T=32 and future_T=32; "
+            "rebuild a provenance-matched cache for any other horizon"
+        )
+    validate_completed_cache_gate(args)
+    validate_group_aware_split_metadata(args)
+    if getattr(args, "train_manifest", None):
+        args.train_manifest = resolve_egodex_data_reference(str(args.train_manifest))
+    if getattr(args, "test_manifest", None):
+        args.test_manifest = resolve_egodex_data_reference(str(args.test_manifest))
     args.preload_cache_to_memory = resolve_cache_preload_policy(args)
 
     ddp = bool(getattr(args, "ddp", False))
@@ -1903,7 +2718,7 @@ def main(args):
     configure_reproducibility_seed(int(getattr(args, "seed", 42)))
     configure_dense_jepa_cudnn()
 
-    num_epoch = int(getattr(args, "epochs", 300))
+    num_epoch = int(getattr(args, "epochs", 200))
     use_amp = (not getattr(args, "no_amp", False)) and device.type == "cuda"
     grad_accum_steps = int(getattr(args, "grad_accum", 1))
     temporal_stride = max(1, int(getattr(args, "temporal_stride", 1)))
@@ -1913,15 +2728,27 @@ def main(args):
     Crit = nn.MSELoss()
 
     # === Dataset ===
+    offline_validated_cache = (
+        bool(getattr(args, "use_npz_cache", False))
+        and bool(getattr(args, "skip_vjepa", False))
+        and bool(getattr(args, "validated_cache_fingerprint", ""))
+    )
+    args.load_cache_images = not (
+        offline_validated_cache
+        and int(getattr(args, "max_visual_batches", 0)) <= 0
+    )
+    if is_primary_process(rank):
+        print(
+            "[INFO] offline cache fast path: "
+            f"load_images={args.load_cache_images}",
+            flush=True,
+        )
+
     # If features come from NPZ or path remapping is needed, make sure the dataloader returns path
     need_paths = bool(
         getattr(args, "use_npz_cache", False)
         or getattr(args, "skip_vjepa", False)
-        or (
-            getattr(args, "predictor", "none") == "thinkjepa"
-            and bool(getattr(args, "thinkjepa_use_cache_ext", True))
-            and bool(getattr(args, "thinkjepa_use_vlm_merge", True))
-        )
+        or bool(getattr(args, "thinkjepa_use_cache_ext", True))
     )
     train_loader, test_loader = build_egodex_dataloaders(
         args.data_dir,
@@ -1952,9 +2779,36 @@ def main(args):
             getattr(args, "preload_cache_to_memory", False)
             and getattr(args, "use_npz_cache", False)
         ),
+        load_cache_images=bool(getattr(args, "load_cache_images", True)),
+        pad_old_to=int(getattr(args, "vlm_pad_old_to", 1280)),
+        pad_new_to=int(getattr(args, "vlm_pad_new_to", 16)),
     )
     train_size = len(train_loader.dataset)
     test_size = len(test_loader.dataset)
+    if bool(getattr(args, "use_npz_cache", False)):
+        train_fingerprint = getattr(
+            train_loader.dataset, "cache_config_fingerprint", None
+        )
+        test_fingerprint = getattr(
+            test_loader.dataset, "cache_config_fingerprint", None
+        )
+        if not train_fingerprint or train_fingerprint != test_fingerprint:
+            raise ValueError(
+                "train/validation cache manifests do not share one causal cache "
+                f"configuration: train={train_fingerprint!r} test={test_fingerprint!r}"
+            )
+        validated_fingerprint = str(
+            getattr(args, "validated_cache_fingerprint", "") or ""
+        )
+        if (
+            validated_fingerprint
+            and str(train_fingerprint) != validated_fingerprint
+        ):
+            raise ValueError(
+                "loaded cache fingerprint differs from completed cache validation: "
+                f"loaded={train_fingerprint!r} validated={validated_fingerprint!r}"
+            )
+        args.cache_config_fingerprint = str(train_fingerprint)
 
     # Cache: build the index once to accelerate per-batch h5->npz lookup
     cache_index = {}
@@ -1964,11 +2818,7 @@ def main(args):
     thinkjepa_vlm_new_dim = int(getattr(args, "thinkjepa_vlm_new_dim", 0))
     if getattr(args, "cache_dir", None) and (
         bool(getattr(args, "skip_vjepa", False))
-        or (
-            getattr(args, "predictor", "none") == "thinkjepa"
-            and bool(getattr(args, "thinkjepa_use_cache_ext", True))
-            and bool(getattr(args, "thinkjepa_use_vlm_merge", True))
-        )
+        or bool(getattr(args, "thinkjepa_use_cache_ext", True))
     ):
         cache_index = build_thinker_cache_index(getattr(args, "cache_dir"))
         if bool(getattr(args, "preload_cache_to_memory", False)):
@@ -1996,11 +2846,19 @@ def main(args):
                 f"from {getattr(args, 'cache_dir')}"
             )
 
-    # === Conditionally load the backbone (public release keeps only V-JEPA) ===
+    args.ddp_world_size = int(world_size)
+    args.effective_global_batch_size = int(
+        int(getattr(args, "train_batch_size", 8))
+        * int(getattr(args, "grad_accum", 1))
+        * int(world_size)
+    )
+    bind_training_contract(args)
+
+    # Load the registered V-JEPA backbone.
     backbone = getattr(args, "backbone", "vjepa").lower()
     if backbone != "vjepa":
         raise ValueError(
-            f"Unsupported backbone in public release: {backbone}. Only 'vjepa' is available."
+            f"Unsupported backbone: {backbone}. Only 'vjepa' is available."
         )
 
     model_pt = None
@@ -2008,11 +2866,15 @@ def main(args):
 
     def _ensure_vjepa_runtime():
         nonlocal model_pt, fast_tx
+        if bool(getattr(args, "skip_vjepa", False)):
+            raise RuntimeError(
+                "--skip_vjepa forbids loading or executing the online V-JEPA encoder"
+            )
         if model_pt is None:
             model_pt, pt_video_transform = load_dense_jepa_encoder()
             for p in model_pt.parameters():
                 p.requires_grad_(False)
-            fast_tx = VideoObservationAdapter(pt_video_transform, antialias=False)
+            fast_tx = VideoObservationAdapter(pt_video_transform, antialias=True)
         return model_pt, fast_tx
 
     if not bool(getattr(args, "skip_vjepa", False)):
@@ -2025,6 +2887,7 @@ def main(args):
             cls_model,
             device_ids=[device.index],
             output_device=device.index,
+            broadcast_buffers=False,
             find_unused_parameters=bool(
                 getattr(args, "ddp_find_unused_parameters", False)
             ),
@@ -2053,8 +2916,8 @@ def main(args):
         train_sampler = DistributedSampler(
             train_ds, num_replicas=world_size, rank=rank, shuffle=True
         )
-        test_sampler = DistributedSampler(
-            test_ds, num_replicas=world_size, rank=rank, shuffle=False
+        test_sampler = DistributedEvalSampler(
+            test_ds, num_replicas=world_size, rank=rank
         )
         train_dl_kwargs = {
             "batch_size": train_loader.batch_size,
@@ -2108,38 +2971,71 @@ def main(args):
         except TypeError:
             torch.distributed.barrier()
     metrics_json_path = out_dir / "metrics.json"
-    logs = load_json_or_default(
-        metrics_json_path,
-        {
-            "epochs": [],
-            "best": {
-                "epoch": -1,
-                "ade": float("inf"),
-                "loss": float("inf"),
-                "pred_loss": float("inf"),
-                "pred_latent_dist": float("inf"),
-                "pred_latent_smooth_l1": float("inf"),
-                "pred_latent_cosine_distance": float("inf"),
-                "ckpt": "",
-            },
-        },
-    )
     resume_ckpt_path = resolve_resume_checkpoint(
         out_dir=out_dir,
         resume_ckpt=getattr(args, "resume_ckpt", ""),
         auto_resume=bool(getattr(args, "auto_resume", False)),
     )
+    if resume_ckpt_path is None:
+        existing_artifacts = find_existing_training_artifacts(out_dir)
+        if existing_artifacts:
+            preview = ", ".join(str(path) for path in existing_artifacts[:5])
+            raise FileExistsError(
+                "fresh training refuses an output directory containing prior run "
+                f"state; use explicit resume or a new OUT_DIR: {preview}"
+            )
+        logs = fresh_training_logs(args)
+    else:
+        if not metrics_json_path.is_file():
+            raise FileNotFoundError(
+                "resume requires metrics.json bound to the checkpoint; missing "
+                f"{metrics_json_path}"
+            )
+        logs = load_json_or_default(metrics_json_path, {})
     resume_predictor_state = None
     resume_optimizer_pred_state = None
     resume_predictor_loaded = False
     start_epoch = 0
     if resume_ckpt_path is not None:
         resume_blob = torch_load_checkpoint(resume_ckpt_path, map_location="cpu")
+        if bool(getattr(args, "use_npz_cache", False)):
+            checkpoint_args = resume_blob.get("args") or {}
+            identity_keys = (
+                "training_implementation_fingerprint",
+                "supervision_manifest_stat_fingerprint",
+                "supervision_file_count",
+                "cache_config_fingerprint",
+                "cache_validation_report_sha256",
+                "split_meta_sha256",
+                "train_manifest_sha256",
+                "test_manifest_sha256",
+                "training_contract_sha256",
+            )
+            mismatches = []
+            for key in identity_keys:
+                current_value = str(getattr(args, key, "") or "")
+                checkpoint_value = str(checkpoint_args.get(key, "") or "")
+                if not current_value or checkpoint_value != current_value:
+                    mismatches.append(
+                        f"{key}: checkpoint={checkpoint_value!r} current={current_value!r}"
+                    )
+            if mismatches:
+                raise ValueError(
+                    "resume checkpoint is not bound to the current validated cache and "
+                    "group split; refusing possible train/validation contamination: "
+                    + "; ".join(mismatches)
+                )
         ckpt_epoch = int(resume_blob.get("epoch", 0))
         if ckpt_epoch < 0:
             raise ValueError(
                 f"invalid checkpoint epoch {ckpt_epoch} in {resume_ckpt_path}"
             )
+        if ckpt_epoch > int(num_epoch):
+            raise ValueError(
+                "resume checkpoint is beyond the requested target epoch; use a new "
+                f"OUT_DIR or request at least {ckpt_epoch} epochs"
+            )
+        validate_resumed_training_logs(logs, args, ckpt_epoch)
         unwrap_ddp_module(cls_model).load_state_dict(
             resume_blob["cls_model"], strict=True
         )
@@ -2153,10 +3049,9 @@ def main(args):
             and scaler is not None
         ):
             scaler.load_state_dict(resume_blob["scaler"])
-        if args.predictor != "none" and ("predictor" not in resume_blob):
+        if "predictor" not in resume_blob:
             raise KeyError(
-                f"resume checkpoint is missing predictor state for predictor={args.predictor}: "
-                f"{resume_ckpt_path}"
+                f"resume checkpoint is missing ThinkJEPA predictor state: {resume_ckpt_path}"
             )
         resume_predictor_state = resume_blob.get("predictor")
         resume_optimizer_pred_state = resume_blob.get("optimizer_pred")
@@ -2169,8 +3064,9 @@ def main(args):
                 f"(completed_epochs={ckpt_epoch}, target_epochs={num_epoch})"
             )
     if is_primary_process(rank):
-        write_json_atomic(logs, metrics_json_path)
+        write_json_atomic(build_training_logs(logs, out_dir), metrics_json_path)
     best_ade = float(logs["best"]["ade"])
+    best_epoch = int(logs["best"].get("epoch", -1))
 
     for epoch in range(start_epoch, num_epoch):
         if ddp and train_sampler is not None:
@@ -2178,8 +3074,12 @@ def main(args):
         if ddp and test_sampler is not None:
             test_sampler.set_epoch(epoch)
         t0 = time.time()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         cls_model.train()
+        if predictor is not None:
+            predictor.train()
         if model_pt is not None:
             model_pt.eval()
         optimizer.zero_grad(set_to_none=True)
@@ -2200,8 +3100,16 @@ def main(args):
             return t.item() > 0
 
         if is_primary_process(rank):
+            train_progress_total = len(train_loader)
+            if int(getattr(args, "max_train_batches", 0)) > 0:
+                train_progress_total = min(
+                    train_progress_total, int(getattr(args, "max_train_batches", 0))
+                )
             pbar = tqdm.tqdm(
-                total=len(train_loader), dynamic_ncols=True, leave=False, disable=False
+                total=train_progress_total,
+                dynamic_ncols=True,
+                leave=False,
+                disable=False,
             )
         else:
 
@@ -2213,6 +3121,7 @@ def main(args):
 
             pbar = _NoBar()
 
+        train_t0 = time.time()
         itr = iter(train_loader)
         step = 0
         while True:
@@ -2220,27 +3129,20 @@ def main(args):
                 batch = next(itr)
             except StopIteration:
                 break
-            except Exception as e:
-                if _is_fatal_camera_geometry_error(e):
-                    raise
-                if is_primary_process(rank):
-                    pbar.write(
-                        f"[DataLoader-ERROR][epoch {epoch}] {type(e).__name__}: {e}"
-                    )
-                pbar.update(1)
-                continue
+            except Exception:
+                raise
 
             step += 1
             if batch is None:
-                pbar.update(1)
-                continue
+                raise RuntimeError(
+                    f"DataLoader returned an empty training batch at epoch={epoch} step={step}"
+                )
 
             # === Handle variable-length tails (may include extras/path) ===
             if len(batch) < 11:
-                if is_primary_process(rank):
-                    pbar.write(f"[WARN] Unexpected batch length: {len(batch)}")
-                pbar.update(1)
-                continue
+                raise RuntimeError(
+                    f"DataLoader returned an incomplete training batch with {len(batch)} fields"
+                )
 
             (
                 xyz_cam,
@@ -2263,16 +3165,25 @@ def main(args):
             xyz_cam = xyz_cam.cuda(non_blocking=True)
             cam_ext = cam_ext.cuda(non_blocking=True)
 
-            # === Get token features: prefer extras cache; otherwise use online extraction or NPZ (V-JEPA only) ===
+            # Load validated split V-JEPA features from the batch cache or its
+            # resolved schema-v2 archive.
             use_cached = False
             if (
                 extras is not None
                 and isinstance(extras, dict)
-                and ("vjepa_feats" in extras)
-                and (extras["vjepa_feats"] is not None)
+                and any(
+                    extras.get(key) is not None
+                    for key in (
+                        "vjepa_input_feats",
+                        "vjepa_target_feats",
+                        "vjepa_feats",
+                    )
+                )
                 and backbone == "vjepa"
             ):
-                out_feats_full = extras["vjepa_feats"].to(dtype=torch.float32).cuda()
+                out_feats_full = assemble_causal_vjepa_features_from_extras(
+                    extras, args, device
+                )
                 use_cached = True
                 vlm_old = extras.get("vlm_old", None)
                 vlm_new = extras.get("vlm_new", None)
@@ -2292,15 +3203,28 @@ def main(args):
                             preloaded_archives=preloaded_cache_archives,
                         )
                     if out_feats_full is None:
+                        if bool(getattr(args, "skip_vjepa", False)):
+                            raise RuntimeError(
+                                "--skip_vjepa is fail-closed: validated cached V-JEPA "
+                                "features were unavailable and online encoder fallback "
+                                "is forbidden"
+                            )
                         model_pt, fast_tx = _ensure_vjepa_runtime()
                         img = fast_tx(img)
                         if img.ndim == 4:
                             img = img.unsqueeze(0)
                         with torch.no_grad():
                             with build_amp_autocast(enabled=use_amp):
-                                out_feats_full = encode_dense_jepa_video(
-                                    img, model_pt
-                                )  # [B,T,P,D]
+                                observed_feats, target_feats = encode_causal_vjepa_windows(
+                                    img,
+                                    model_pt,
+                                    past_frames=args.past_T,
+                                    future_frames=args.future_T,
+                                    align_to_frames=True,
+                                )
+                                out_feats_full = torch.cat(
+                                    [observed_feats, target_feats], dim=1
+                                ).contiguous()
             if temporal_stride > 1:
                 xyz_world = stride_time_tensor(xyz_world, temporal_stride)
                 xyz_cam = stride_time_tensor(xyz_cam, temporal_stride)
@@ -2320,26 +3244,20 @@ def main(args):
                 (p0, p1), (f0, f1) = (0, total), (0, total)
             Tpred = f1 - f0
             feats_gt_full = out_feats_full.contiguous()
-            feats_teacher_full = (
-                torch.zeros_like(feats_gt_full)
-                if bool(getattr(args, "zero_visual_input", False))
-                else feats_gt_full
+            feats_teacher_full = feats_gt_full
+
+            extras = ensure_thinker_guidance_payload(
+                extras=extras,
+                paths=paths,
+                args=args,
+                device=device,
+                cache_index=cache_index,
+                path_cache=cache_path_cache,
+                preloaded_archives=preloaded_cache_archives,
             )
 
-            if args.predictor == "thinkjepa":
-                extras = ensure_thinker_guidance_payload(
-                    extras=extras,
-                    paths=paths,
-                    args=args,
-                    device=device,
-                    cache_index=cache_index,
-                    path_cache=cache_path_cache,
-                    preloaded_archives=preloaded_cache_archives,
-                )
-
             # ==== (re)init predictor lazily ====
-            use_pred = args.predictor != "none"
-            if use_pred and (predictor is None):
+            if predictor is None:
                 D = feats_teacher_full.shape[-1]
                 P = feats_teacher_full.shape[2]
                 if args.trajmode == "traj":
@@ -2348,152 +3266,104 @@ def main(args):
                     total = min(Tall, args.past_T + args.future_T)
                     total_frames = total
 
-                if args.predictor == "tiny":
-                    predictor = PatchwiseAutoregressiveRolloutHead(
-                        in_dim=D, model_dim=384, depth=2, nhead=6, dropout=0.1
-                    ).cuda()
-                elif args.predictor == "official":
-                    predictor = VisionTransformerPredictor(
-                        img_size=(P, 1),
-                        patch_size=1,
-                        num_frames=total_frames,
-                        tubelet_size=1,
-                        embed_dim=D,
-                        predictor_embed_dim=384,
-                        depth=12,
-                        num_heads=6,
-                        mlp_ratio=4.0,
-                        drop_rate=0.1,
-                        attn_drop_rate=0.0,
-                        drop_path_rate=0.1,
-                        norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                        init_std=0.02,
-                        uniform_power=False,
-                        use_mask_tokens=True,
-                        num_mask_tokens=1,
-                        zero_init_mask_tokens=True,
-                        use_silu=False,
-                        wide_silu=True,
-                        use_activation_checkpointing=False,
-                        return_all_tokens=False,
-                        chop_last_n_tokens=0,
-                        use_rope=True,
-                    ).cuda()
-                elif args.predictor == "thinkjepa":
-                    thinkjepa_use_vlm_merge = bool(
-                        getattr(args, "thinkjepa_use_vlm_merge", True)
+                thinkjepa_vlm_cond_mode = str(
+                    getattr(args, "thinkjepa_vlm_cond_mode", "film")
+                ).lower()
+                if thinkjepa_vlm_cond_mode not in {"film", "crossattn", "adaln"}:
+                    thinkjepa_vlm_cond_mode = "film"
+                old_dim_from_extras = guidance_feature_dim_from_payload(extras, "vlm_old")
+                new_dim_from_extras = guidance_feature_dim_from_payload(extras, "vlm_new")
+                eff_old_dim = (
+                    int(thinkjepa_vlm_old_dim)
+                    if int(thinkjepa_vlm_old_dim) > 0
+                    else (
+                        int(old_dim_from_extras)
+                        if old_dim_from_extras is not None
+                        else 3584
                     )
-                    thinkjepa_vlm_cond_mode = str(
-                        getattr(args, "thinkjepa_vlm_cond_mode", "film")
-                    ).lower()
-                    if thinkjepa_vlm_cond_mode not in {"film", "crossattn", "adaln"}:
-                        thinkjepa_vlm_cond_mode = "film"
-                    if thinkjepa_use_vlm_merge:
-                        old_dim_from_extras = guidance_feature_dim_from_payload(extras, "vlm_old")
-                        new_dim_from_extras = guidance_feature_dim_from_payload(extras, "vlm_new")
-                        eff_old_dim = (
-                            int(thinkjepa_vlm_old_dim)
-                            if int(thinkjepa_vlm_old_dim) > 0
-                            else (
-                                int(old_dim_from_extras)
-                                if old_dim_from_extras is not None
-                                else 3584
-                            )
-                        )
-                        eff_new_dim = (
-                            int(thinkjepa_vlm_new_dim)
-                            if int(thinkjepa_vlm_new_dim) > 0
-                            else (
-                                int(new_dim_from_extras)
-                                if new_dim_from_extras is not None
-                                else 3584
-                            )
-                        )
-                        thinkjepa_vlm_old_dim, thinkjepa_vlm_new_dim = eff_old_dim, eff_new_dim
-                        if is_primary_process(rank):
-                            print(
-                                f"[INFO] ThinkJEPA predictor VLM proj dims: "
-                                f"old={thinkjepa_vlm_old_dim} new={thinkjepa_vlm_new_dim} "
-                                f"mode={thinkjepa_vlm_cond_mode}"
-                            )
-                    else:
-                        thinkjepa_vlm_old_dim, thinkjepa_vlm_new_dim = 1, 1
-                        if is_primary_process(rank):
-                            print(
-                                "[INFO] ThinkJEPA predictor VLM merge disabled; "
-                                "running direct ViT conditioning baseline."
-                            )
-                    predictor = CortexGuidedVideoPredictor(
-                        img_size=(P, 1),
-                        patch_size=1,
-                        num_frames=total_frames,
-                        tubelet_size=1,
-                        embed_dim=D,
-                        predictor_embed_dim=384,
-                        depth=12,
-                        num_heads=6,
-                        mlp_ratio=4.0,
-                        drop_rate=0.1,
-                        attn_drop_rate=0.0,
-                        drop_path_rate=0.1,
-                        norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                        init_std=0.02,
-                        uniform_power=False,
-                        use_mask_tokens=True,
-                        num_mask_tokens=2,
-                        zero_init_mask_tokens=True,
-                        use_silu=False,
-                        wide_silu=True,
-                        use_activation_checkpointing=False,
-                        return_all_tokens=False,
-                        chop_last_n_tokens=0,
-                        use_rope=True,
-                        use_vlm_merge=thinkjepa_use_vlm_merge,
-                        vlm_cond_mode=thinkjepa_vlm_cond_mode,
-                        vlm_old_dim=thinkjepa_vlm_old_dim,
-                        vlm_new_dim=thinkjepa_vlm_new_dim,
-                    ).cuda()
-                else:
-                    predictor = None
+                )
+                eff_new_dim = (
+                    int(thinkjepa_vlm_new_dim)
+                    if int(thinkjepa_vlm_new_dim) > 0
+                    else (
+                        int(new_dim_from_extras)
+                        if new_dim_from_extras is not None
+                        else 3584
+                    )
+                )
+                thinkjepa_vlm_old_dim, thinkjepa_vlm_new_dim = eff_old_dim, eff_new_dim
+                if is_primary_process(rank):
+                    print(
+                        f"[INFO] ThinkJEPA predictor VLM proj dims: "
+                        f"old={thinkjepa_vlm_old_dim} new={thinkjepa_vlm_new_dim} "
+                        f"mode={thinkjepa_vlm_cond_mode}"
+                    )
+                predictor = CortexGuidedVideoPredictor(
+                    img_size=(P, 1),
+                    patch_size=1,
+                    num_frames=total_frames,
+                    tubelet_size=1,
+                    embed_dim=D,
+                    predictor_embed_dim=384,
+                    depth=12,
+                    num_heads=6,
+                    mlp_ratio=4.0,
+                    drop_rate=0.1,
+                    attn_drop_rate=0.0,
+                    drop_path_rate=0.1,
+                    norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                    init_std=0.02,
+                    uniform_power=False,
+                    use_mask_tokens=True,
+                    num_mask_tokens=2,
+                    zero_init_mask_tokens=True,
+                    use_silu=False,
+                    wide_silu=True,
+                    use_activation_checkpointing=False,
+                    return_all_tokens=False,
+                    chop_last_n_tokens=0,
+                    use_rope=True,
+                    use_vlm_merge=True,
+                    vlm_cond_mode=thinkjepa_vlm_cond_mode,
+                    vlm_old_dim=thinkjepa_vlm_old_dim,
+                    vlm_new_dim=thinkjepa_vlm_new_dim,
+                    causal_attention=True,
+                ).cuda()
 
-                if ddp and (predictor is not None):
-                    predictor_find_unused = bool(
-                        getattr(args, "ddp_find_unused_parameters", False)
-                    )
-                    if args.predictor == "thinkjepa":
-                        predictor_find_unused = True
-                        if is_primary_process(rank):
-                            print(
-                                "[INFO] enabling DDP find_unused_parameters for ThinkJEPA predictor"
-                            )
+                if ddp:
+                    predictor_find_unused = True
+                    if is_primary_process(rank):
+                        print(
+                            "[INFO] enabling DDP find_unused_parameters for ThinkJEPA predictor"
+                        )
                     predictor = torch.nn.parallel.DistributedDataParallel(
                         predictor,
                         device_ids=[device.index],
                         output_device=device.index,
+                        broadcast_buffers=False,
                         find_unused_parameters=predictor_find_unused,
                     )
 
-                if predictor is not None:
-                    optimizer_pred = torch.optim.AdamW(
-                        (p for p in predictor.parameters() if p.requires_grad),
-                        lr=float(getattr(args, "lr_pred", 1e-4)),
-                        weight_decay=1e-4,
+                optimizer_pred = torch.optim.AdamW(
+                    (p for p in predictor.parameters() if p.requires_grad),
+                    lr=float(getattr(args, "lr_pred", 1e-4)),
+                    weight_decay=1e-4,
+                )
+                if not resume_predictor_loaded and (
+                    resume_predictor_state is not None
+                ):
+                    unwrap_ddp_module(predictor).load_state_dict(
+                        resume_predictor_state, strict=True
                     )
-                    if not resume_predictor_loaded and (
-                        resume_predictor_state is not None
-                    ):
-                        unwrap_ddp_module(predictor).load_state_dict(
-                            resume_predictor_state, strict=True
+                    if resume_optimizer_pred_state is not None:
+                        optimizer_pred.load_state_dict(
+                            resume_optimizer_pred_state
                         )
-                        if resume_optimizer_pred_state is not None:
-                            optimizer_pred.load_state_dict(
-                                resume_optimizer_pred_state
-                            )
-                        resume_predictor_loaded = True
-                        if is_primary_process(rank):
-                            print(
-                                "[INFO] loaded predictor/optimizer_pred state from resume checkpoint"
-                            )
+                    resume_predictor_loaded = True
+                    if is_primary_process(rank):
+                        print(
+                            "[INFO] loaded predictor/optimizer_pred state from resume checkpoint"
+                        )
 
             # ==== predictor forward (build pred_loss & feats_task_in) ====
             pred_metrics = {
@@ -2502,143 +3372,57 @@ def main(args):
                 "pred_latent_smooth_l1": torch.tensor(0.0, device=device),
                 "pred_latent_cosine_distance": torch.tensor(0.0, device=device),
             }
-            pred_metric_valid = False
-            if use_pred and (predictor is not None):
-                if args.predictor == "tiny":
-                    # Strictly use the history window (p0, p1) as feats_ar_in (left side)
-                    feats_ar_in = feats_teacher_full[:, p0:p1, ...].contiguous()
-                    with build_amp_autocast(enabled=use_amp):
-                        try:
-                            pred_feats_past = predictor(feats_ar_in)  # [B, p1-p0, P, D]
-                        except TypeError:
-                            pred_feats_past = predictor(
-                                feats_ar_in,
-                                attn_mask=build_future_causal_mask(
-                                    feats_ar_in.shape[1], feats_ar_in.device
-                                ),
-                            )
-                        tgt_feats_future = feats_gt_full[:, f0:f1, ...].detach()
-                        if Tpred > 0:
-                            pred_feats_future = pred_feats_past[
-                                :, -Tpred:, ...
-                            ].contiguous()
-                            pred_metrics = compute_predicted_latent_metrics(
-                                pred_feats_future, tgt_feats_future
-                            )
-                            pred_metric_valid = True
-                        else:
-                            pred_metrics["pred_loss"] = pred_feats_past.new_zeros(())
-                    feats_task_in = pred_feats_past.detach()
+            # Build the V-JEPA total window and causal context/target masks.
+            total_frames = (
+                ((p1 - p0) + max(0, f1 - f0))
+                if args.trajmode == "traj"
+                else min(Tall, args.past_T + args.future_T)
+            )
+            feats_total = feats_teacher_full[:, :total_frames, ...].contiguous()
+            B_, total_, P_, D_ = feats_total.shape
+            x_seq = flatten_temporal_patch_tokens(feats_total)
 
-                elif args.predictor == "official":
-                    # Use [p0:p1] + [f0:f1] as the full window and build relative time indices
-                    total_frames = (
-                        (p1 - p0) + max(0, f1 - f0)
-                        if args.trajmode == "traj"
-                        else min(Tall, args.past_T + args.future_T)
-                    )
-                    feats_total = feats_teacher_full[:, :total_frames, ...].contiguous()
-                    B_, total_, P_, D_ = feats_total.shape
-                    x_seq = flatten_temporal_patch_tokens(feats_total)
-
-                    # History context occupies [0, p1-p0) in the concatenated sequence
-                    ctx_len = p1 - p0
-                    idx_ctx_1d = build_temporal_patch_indices(P_, 0, ctx_len)
-
-                    if args.trajmode == "traj":
-                        # Target interval is [ctx_len, ctx_len + (f1-f0))
-                        T_tgt = f1 - f0
-                        idx_tgt_1d = build_temporal_patch_indices(P_, ctx_len, ctx_len + T_tgt)
-                    else:
-                        T_tgt = ctx_len
-                        idx_tgt_1d = idx_ctx_1d
-
-                    masks_x = repeat_indices_for_batch(
-                        idx_ctx_1d, B_, device=x_seq.device
-                    )
-                    masks_y = repeat_indices_for_batch(
-                        idx_tgt_1d, B_, device=x_seq.device
-                    )
-
-                    x_ctxt = x_seq.gather(
-                        dim=1, index=masks_x.unsqueeze(-1).expand(-1, -1, D_)
-                    )
-
-                    with build_amp_autocast(enabled=use_amp):
-                        y_future_seq = predictor(
-                            x_ctxt, masks_x, masks_y
-                        )  # [B, N_tgt, D]
-                        y_future = y_future_seq.view(B_, T_tgt, P_, D_)
-                        tgt_future = (
-                            feats_gt_full[:, f0:f1, ...].detach()
-                            if args.trajmode == "traj"
-                            else feats_gt_full[:, p0:p1, ...].detach()
-                        )
-                        pred_metrics = compute_predicted_latent_metrics(y_future, tgt_future)
-                        pred_metric_valid = True
-
-                    # Feed only future features into the downstream head
-                    feats_task_in = y_future.detach()
-
-                elif args.predictor == "thinkjepa":
-                    # 1) Build the V-JEPA total window and flatten the sequence
-                    total_frames = (
-                        ((p1 - p0) + max(0, f1 - f0))
-                        if args.trajmode == "traj"
-                        else min(Tall, args.past_T + args.future_T)
-                    )
-                    feats_total = feats_teacher_full[:, :total_frames, ...].contiguous()
-                    B_, total_, P_, D_ = feats_total.shape
-                    x_seq = flatten_temporal_patch_tokens(feats_total)  # [B, total*P, D]
-
-                    # 2) Build masks_x / masks_y (global indices)
-                    ctx_len = p1 - p0
-                    idx_ctx_1d = build_temporal_patch_indices(P_, 0, ctx_len)  # [ctx_len*P]
-                    if args.trajmode == "traj":
-                        T_tgt = f1 - f0
-                        idx_tgt_1d = build_temporal_patch_indices(P_, ctx_len, ctx_len + T_tgt)
-                    else:
-                        T_tgt = ctx_len
-                        idx_tgt_1d = idx_ctx_1d
-                    masks_x = repeat_indices_for_batch(
-                        idx_ctx_1d.long(), B_, device=x_seq.device
-                    )
-                    masks_y = repeat_indices_for_batch(
-                        idx_tgt_1d.long(), B_, device=x_seq.device
-                    )
-
-                    # 3) Gather context tokens
-                    x_ctxt = x_seq.gather(
-                        dim=1, index=masks_x.unsqueeze(-1).expand(-1, -1, D_)
-                    )
-
-                    # 4) Assemble ext (VLM conditioning)
-                    ext = build_thinkjepa_guidance_inputs(
-                        extras=extras,
-                        args=args,
-                        device=x_seq.device,
-                    )
-
-                    with build_amp_autocast(enabled=use_amp):
-                        y_future_seq = predictor(
-                            x_ctxt, masks_x, masks_y, ext=ext
-                        )  # [B, N_tgt, D]
-                        y_future = y_future_seq.view(B_, T_tgt, P_, D_)
-                        tgt_future = (
-                            feats_gt_full[:, f0:f1, ...].detach()
-                            if args.trajmode == "traj"
-                            else feats_gt_full[:, p0:p1, ...].detach()
-                        )
-                        pred_metrics = compute_predicted_latent_metrics(y_future, tgt_future)
-                        pred_metric_valid = True
-
-                    feats_task_in = y_future.detach()
-
+            ctx_len = p1 - p0
+            idx_ctx_1d = build_temporal_patch_indices(P_, 0, ctx_len)
+            if args.trajmode == "traj":
+                T_tgt = f1 - f0
+                idx_tgt_1d = build_temporal_patch_indices(P_, ctx_len, ctx_len + T_tgt)
             else:
-                feats_task_in = feats_teacher_full[:, p0:p1, ...].contiguous()
+                T_tgt = ctx_len
+                idx_tgt_1d = idx_ctx_1d
+            masks_x = repeat_indices_for_batch(
+                idx_ctx_1d.long(), B_, device=x_seq.device
+            )
+            masks_y = repeat_indices_for_batch(
+                idx_tgt_1d.long(), B_, device=x_seq.device
+            )
+            x_ctxt = x_seq.gather(
+                dim=1, index=masks_x.unsqueeze(-1).expand(-1, -1, D_)
+            )
+            ext = build_thinkjepa_guidance_inputs(
+                extras=extras,
+                args=args,
+                device=x_seq.device,
+            )
 
-            # === (NEW) joint_pred: feed both past and future teacher/predicted features into the downstream head
-            # === only in traj mode with Tpred > 0 ===
+            with build_amp_autocast(enabled=use_amp):
+                y_future_seq = predictor(x_ctxt, masks_x, masks_y, ext=ext)
+                y_future = y_future_seq.view(B_, T_tgt, P_, D_)
+                tgt_future = (
+                    feats_gt_full[:, f0:f1, ...].detach()
+                    if args.trajmode == "traj"
+                    else feats_gt_full[:, p0:p1, ...].detach()
+                )
+                pred_metrics = compute_predicted_latent_metrics(y_future, tgt_future)
+            pred_metric_valid = True
+            feats_task_in = (
+                y_future
+                if bool(getattr(args, "optimize_together_downstream", False))
+                else y_future.detach()
+            )
+
+            # The trajectory head sees observed latents plus predictor-generated
+            # future latents. Ground-truth future latents are never head inputs.
             if (
                 getattr(args, "joint_pred", False)
                 and args.trajmode == "traj"
@@ -2654,9 +3438,16 @@ def main(args):
 
             # === targets & refs ===
             target_world = target_world_full[:, f0:f1, ...].contiguous()
-            cam_ext_slice = cam_ext[:, f0:f1, ...].contiguous()
+            # Future camera poses and future hand joints are unavailable at
+            # inference.  Hold the final observed geometry fixed across the
+            # prediction horizon instead of using oracle target-time values.
+            cam_ext_slice = cam_ext[:, p1 - 1 : p1, ...].expand(
+                -1, Tpred, -1, -1
+            ).contiguous()
 
-            xyz_cam_slice = xyz_cam[:, f0:f1, ...].contiguous()
+            xyz_cam_slice = xyz_cam[:, p1 - 1 : p1, ...].expand(
+                -1, Tpred, -1, -1
+            ).contiguous()
             right_ref_cam = xyz_cam_slice[..., right_idx, :]
             left_ref_cam = xyz_cam_slice[..., left_idx, :]
 
@@ -2691,11 +3482,8 @@ def main(args):
             nonfinite_reasons = []
             if not torch.isfinite(task_loss).all():
                 nonfinite_reasons.append(f"task_loss={scalar_debug_string(task_loss)}")
-            if (
-                use_pred
-                and (predictor is not None)
-                and pred_metric_valid
-                and (not torch.isfinite(pred_metrics["pred_loss"]).all())
+            if pred_metric_valid and (
+                not torch.isfinite(pred_metrics["pred_loss"]).all()
             ):
                 nonfinite_reasons.append(
                     f"pred_loss={scalar_debug_string(pred_metrics['pred_loss'])}"
@@ -2736,11 +3524,7 @@ def main(args):
                 continue
 
             # === backward ===
-            if (
-                use_pred
-                and args.optimize_together_downstream
-                and (predictor is not None)
-            ):
+            if args.optimize_together_downstream:
                 total_loss = (
                     args.lambda_task * task_loss
                     + args.lambda_pred * pred_metrics["pred_loss"]
@@ -2751,11 +3535,7 @@ def main(args):
                     total_loss.backward()
                 display_loss = total_loss.detach()
                 accum_steps += 1
-            elif (
-                use_pred
-                and (predictor is not None)
-                and not args.optimize_together_downstream
-            ):
+            else:
                 if optimizer_pred is not None:
                     optimizer_pred.zero_grad(set_to_none=True)
                     loss_pred_norm = pred_metrics["pred_loss"] / max(
@@ -2773,38 +3553,36 @@ def main(args):
                     loss_task_norm.backward()
                 display_loss = task_loss.detach()
                 accum_steps += 1
-            else:
-                loss_task_norm = task_loss / max(grad_accum_steps, 1)
-                if use_amp:
-                    scaler.scale(loss_task_norm).backward()
-                else:
-                    loss_task_norm.backward()
-                display_loss = task_loss.detach()
-                accum_steps += 1
-
             if _any_rank(0, ddp):  # skip_this is always 0 here; keep the structure unchanged
                 pbar.update(1)
                 continue
 
-            train_loss_sum += float(display_loss.item() * max(grad_accum_steps, 1))
-            train_acc_sum += float(acc)
-            train_avgdist_sum += float(avg_dist.mean().item())
-            train_finaldist_sum += float(final_dist.mean().item())
-            train_count += 1
+            batch_sample_count = int(target_world.shape[0])
+            train_loss_sum += float(
+                display_loss.item()
+                * max(grad_accum_steps, 1)
+                * batch_sample_count
+            )
+            train_acc_sum += float(acc) * batch_sample_count
+            train_avgdist_sum += float(avg_dist.mean().item()) * batch_sample_count
+            train_finaldist_sum += float(final_dist.mean().item()) * batch_sample_count
+            train_count += batch_sample_count
             if pred_metric_valid:
                 for key in train_lat_metric_sums:
-                    train_lat_metric_sums[key] += float(pred_metrics[key].item())
-                train_pred_count += 1
+                    train_lat_metric_sums[key] += (
+                        float(pred_metrics[key].item()) * batch_sample_count
+                    )
+                train_pred_count += batch_sample_count
 
             if accum_steps >= max(grad_accum_steps, 1):
                 if use_amp:
                     scaler.step(optimizer)
-                    if use_pred and (optimizer_pred is not None):
+                    if optimizer_pred is not None:
                         scaler.step(optimizer_pred)
                     scaler.update()
                 else:
                     optimizer.step()
-                    if use_pred and (optimizer_pred is not None):
+                    if optimizer_pred is not None:
                         optimizer_pred.step()
                 optimizer.zero_grad(set_to_none=True)
                 if optimizer_pred is not None:
@@ -2815,11 +3593,7 @@ def main(args):
                 pbar.set_postfix(
                     {
                         "loss": f"{float(display_loss.item()):.4f}",
-                        "pred_loss": (
-                            f"{float(pred_metrics['pred_loss'].item()):.4f}"
-                            if (use_pred and predictor is not None)
-                            else "NA"
-                        ),
+                        "pred_loss": f"{float(pred_metrics['pred_loss'].item()):.4f}",
                         "pred_lat": (
                             f"{float(pred_metrics['pred_latent_dist'].item()):.4f}"
                             if pred_metric_valid
@@ -2842,6 +3616,11 @@ def main(args):
                     }
                 )
             pbar.update(1)
+            if (
+                int(getattr(args, "max_train_batches", 0)) > 0
+                and step >= int(getattr(args, "max_train_batches", 0))
+            ):
+                break
 
         if is_primary_process(rank):
             pbar.close()
@@ -2849,19 +3628,22 @@ def main(args):
         if accum_steps > 0:
             if use_amp:
                 scaler.step(optimizer)
-                if (args.predictor != "none") and (optimizer_pred is not None):
+                if optimizer_pred is not None:
                     scaler.step(optimizer_pred)
                 scaler.update()
             else:
                 optimizer.step()
-                if (args.predictor != "none") and (optimizer_pred is not None):
+                if optimizer_pred is not None:
                     optimizer_pred.step()
             optimizer.zero_grad(set_to_none=True)
             if optimizer_pred is not None:
                 optimizer_pred.zero_grad(set_to_none=True)
+        train_dt = time.time() - train_t0
 
         # ---------------- Eval ----------------
         cls_model.eval()
+        if predictor is not None:
+            predictor.eval()
         if model_pt is not None:
             model_pt.eval()
         test_loss_sum = test_acc_sum = test_avgdist_sum = test_finaldist_sum = 0.0
@@ -2869,27 +3651,31 @@ def main(args):
         test_count = 0
         test_pred_count = 0
 
+        eval_t0 = time.time()
         with torch.no_grad():
             itr_test = iter(test_loader)
             composed_pool = []  # for visualization across batches
             vis_batch_count = 0  # Track how many batches have already been visualized
             max_vis_batches = getattr(args, "max_visual_batches", 10)
+            eval_batches_seen = 0
+            capture_visuals_this_epoch = bool(
+                visualize_flag
+                and epoch % 10 == 0
+                and is_primary_process(rank)
+                and max_vis_batches > 0
+            )
             while True:
                 try:
                     batch = next(itr_test)
                 except StopIteration:
                     break
-                except Exception as e:
-                    if _is_fatal_camera_geometry_error(e):
-                        raise
-                    if is_primary_process(rank):
-                        print(
-                            f"[DataLoader-ERROR][EVAL][epoch {epoch}] {type(e).__name__}: {e}"
-                        )
-                    continue
+                except Exception:
+                    raise
 
                 if batch is None or len(batch) < 11:
-                    continue
+                    raise RuntimeError(
+                        "DataLoader returned an empty or incomplete evaluation batch"
+                    )
 
                 (
                     xyz_cam,
@@ -2909,19 +3695,25 @@ def main(args):
                 xyz_world = xyz_world.to(device, non_blocking=True)
                 xyz_cam = xyz_cam.to(device, non_blocking=True)
                 cam_ext = cam_ext.to(device, non_blocking=True)
-                img_ori = img.detach().clone()
+                img_ori = img.detach().clone() if capture_visuals_this_epoch else None
 
-                # === Get token features: prefer extras (V-JEPA only), otherwise use online extraction or NPZ ===
+                # Match training: load only validated split V-JEPA features.
                 use_cached = False
                 if (
                     extras is not None
                     and isinstance(extras, dict)
-                    and ("vjepa_feats" in extras)
-                    and (extras["vjepa_feats"] is not None)
+                    and any(
+                        extras.get(key) is not None
+                        for key in (
+                            "vjepa_input_feats",
+                            "vjepa_target_feats",
+                            "vjepa_feats",
+                        )
+                    )
                     and backbone == "vjepa"
                 ):
-                    out_feats_full = extras["vjepa_feats"].to(
-                        device=device, dtype=torch.float32
+                    out_feats_full = assemble_causal_vjepa_features_from_extras(
+                        extras, args, device
                     )
                     use_cached = True
 
@@ -2940,11 +3732,26 @@ def main(args):
                                 preloaded_archives=preloaded_cache_archives,
                             )
                         if out_feats_full is None:
+                            if bool(getattr(args, "skip_vjepa", False)):
+                                raise RuntimeError(
+                                    "--skip_vjepa is fail-closed during evaluation: "
+                                    "validated cached V-JEPA features were unavailable "
+                                    "and online encoder fallback is forbidden"
+                                )
                             model_pt, fast_tx = _ensure_vjepa_runtime()
                             img = fast_tx(img)
                             if img.ndim == 4:
                                 img = img.unsqueeze(0)
-                            out_feats_full = encode_dense_jepa_video(img, model_pt)
+                            observed_feats, target_feats = encode_causal_vjepa_windows(
+                                img,
+                                model_pt,
+                                past_frames=args.past_T,
+                                future_frames=args.future_T,
+                                align_to_frames=True,
+                            )
+                            out_feats_full = torch.cat(
+                                [observed_feats, target_feats], dim=1
+                            ).contiguous()
                 if temporal_stride > 1:
                     xyz_world = stride_time_tensor(xyz_world, temporal_stride)
                     xyz_cam = stride_time_tensor(xyz_cam, temporal_stride)
@@ -2965,159 +3772,79 @@ def main(args):
 
                 Tpred = f1 - f0
                 feats_gt_full = out_feats_full.contiguous()
-                feats_eval_full = (
-                    torch.zeros_like(feats_gt_full)
-                    if bool(getattr(args, "zero_visual_input", False))
-                    else feats_gt_full
-                )
+                feats_eval_full = feats_gt_full
                 xyz_world_slice = xyz_world[:, f0:f1, ...].contiguous()
-                cam_ext_slice = cam_ext[:, f0:f1, ...].contiguous()
+                cam_ext_slice = cam_ext[:, p1 - 1 : p1, ...].expand(
+                    -1, Tpred, -1, -1
+                ).contiguous()
 
-                if args.predictor == "thinkjepa":
-                    extras = ensure_thinker_guidance_payload(
-                        extras=extras,
-                        paths=paths,
-                        args=args,
-                        device=device,
-                        cache_index=cache_index,
-                        path_cache=cache_path_cache,
-                        preloaded_archives=preloaded_cache_archives,
-                    )
+                extras = ensure_thinker_guidance_payload(
+                    extras=extras,
+                    paths=paths,
+                    args=args,
+                    device=device,
+                    cache_index=cache_index,
+                    path_cache=cache_path_cache,
+                    preloaded_archives=preloaded_cache_archives,
+                )
 
-                use_pred = (args.predictor != "none") and (predictor is not None)
                 pred_metrics_eval = {
                     "pred_loss": torch.tensor(0.0, device=device),
                     "pred_latent_dist": torch.tensor(0.0, device=device),
                     "pred_latent_smooth_l1": torch.tensor(0.0, device=device),
                     "pred_latent_cosine_distance": torch.tensor(0.0, device=device),
                 }
-                pred_metric_valid = False
-                if use_pred:
-                    if args.predictor == "tiny":
-                        feats_ar_in = feats_eval_full[:, p0:p1, ...].contiguous()
-                        try:
-                            pred_feats_past = predictor(feats_ar_in)
-                        except TypeError:
-                            pred_feats_past = predictor(
-                                feats_ar_in,
-                                attn_mask=build_future_causal_mask(
-                                    feats_ar_in.shape[1], feats_ar_in.device
-                                ),
-                            )
-                        tgt_future = feats_gt_full[:, f0:f1, ...].detach()
-                        if Tpred > 0:
-                            pred_feats_future = pred_feats_past[:, -Tpred:, ...].contiguous()
-                            pred_metrics_eval = compute_predicted_latent_metrics(
-                                pred_feats_future, tgt_future
-                            )
-                            pred_metric_valid = True
-                        feats_task_in = pred_feats_past.detach()
+                # Keep evaluation aligned with training: causal V-JEPA masks plus
+                # the configured ThinkJEPA VLM conditioner.
+                total_frames = (
+                    ((p1 - p0) + max(0, f1 - f0))
+                    if args.trajmode == "traj"
+                    else min(Tall, args.past_T + args.future_T)
+                )
+                feats_total = feats_eval_full[:, :total_frames, ...].contiguous()
+                B_, total_, P_, D_ = feats_total.shape
+                x_seq = flatten_temporal_patch_tokens(feats_total)
 
-                    elif args.predictor == "official":
-                        ctx_len = p1 - p0
-                        feats_total = torch.cat(
-                            [
-                                feats_eval_full[:, p0:p1, ...].contiguous(),
-                                (
-                                    feats_eval_full[:, f0:f1, ...].contiguous()
-                                    if args.trajmode == "traj"
-                                    else feats_eval_full[:, p0:p1, ...].contiguous()
-                                ),
-                            ],
-                            dim=1,
-                        )
-                        B_, total_, P_, D_ = feats_total.shape
-                        x_seq = flatten_temporal_patch_tokens(feats_total)
-
-                        # History context interval [0, ctx_len)
-                        idx_ctx_1d = build_temporal_patch_indices(P_, 0, ctx_len)
-                        masks_x = repeat_indices_for_batch(
-                            idx_ctx_1d, B_, device=x_seq.device
-                        )
-                        x_ctxt = x_seq.gather(
-                            dim=1, index=masks_x.unsqueeze(-1).expand(-1, -1, D_)
-                        )
-
-                        # Target (future) interval [ctx_len, ctx_len + T_tgt)
-                        T_tgt = (f1 - f0) if args.trajmode == "traj" else ctx_len
-                        idx_tgt_1d = build_temporal_patch_indices(P_, ctx_len, ctx_len + T_tgt)
-                        masks_y = repeat_indices_for_batch(
-                            idx_tgt_1d, B_, device=x_seq.device
-                        )
-
-                        with build_amp_autocast(enabled=use_amp):
-                            y_future_seq = predictor(
-                                x_ctxt, masks_x, masks_y
-                            )  # [B, N_tgt, D]
-                            y_future = y_future_seq.view(B_, T_tgt, P_, D_)
-                        tgt_future = (
-                            feats_gt_full[:, f0:f1, ...].detach()
-                            if args.trajmode == "traj"
-                            else feats_gt_full[:, p0:p1, ...].detach()
-                        )
-                        pred_metrics_eval = compute_predicted_latent_metrics(
-                            y_future, tgt_future
-                        )
-                        pred_metric_valid = True
-
-                        # Feed only future features into the downstream head
-                        feats_task_in = y_future.detach()
-
-                    elif args.predictor == "thinkjepa":
-                        # Keep evaluation aligned with training: use x + masks and route VLM through ext conditioning
-                        total_frames = (
-                            ((p1 - p0) + max(0, f1 - f0))
-                            if args.trajmode == "traj"
-                            else min(Tall, args.past_T + args.future_T)
-                        )
-                        feats_total = feats_eval_full[:, :total_frames, ...].contiguous()
-                        B_, total_, P_, D_ = feats_total.shape
-                        x_seq = flatten_temporal_patch_tokens(feats_total)
-
-                        ctx_len = p1 - p0
-                        idx_ctx_1d = build_temporal_patch_indices(P_, 0, ctx_len)
-                        if args.trajmode == "traj":
-                            T_tgt = f1 - f0
-                            idx_tgt_1d = build_temporal_patch_indices(P_, ctx_len, ctx_len + T_tgt)
-                        else:
-                            T_tgt = ctx_len
-                            idx_tgt_1d = idx_ctx_1d
-
-                        masks_x = repeat_indices_for_batch(
-                            idx_ctx_1d.long(), B_, device=x_seq.device
-                        )
-                        masks_y = repeat_indices_for_batch(
-                            idx_tgt_1d.long(), B_, device=x_seq.device
-                        )
-
-                        x_ctxt = x_seq.gather(
-                            dim=1, index=masks_x.unsqueeze(-1).expand(-1, -1, D_)
-                        )
-
-                        ext = build_thinkjepa_guidance_inputs(
-                            extras=extras,
-                            args=args,
-                            device=x_seq.device,
-                        )
-
-                        with build_amp_autocast(enabled=use_amp):
-                            y_future_seq = predictor(x_ctxt, masks_x, masks_y, ext=ext)
-                            y_future = y_future_seq.view(B_, T_tgt, P_, D_)
-                        tgt_future = (
-                            feats_gt_full[:, f0:f1, ...].detach()
-                            if args.trajmode == "traj"
-                            else feats_gt_full[:, p0:p1, ...].detach()
-                        )
-                        pred_metrics_eval = compute_predicted_latent_metrics(
-                            y_future, tgt_future
-                        )
-                        pred_metric_valid = True
-
-                        feats_task_in = y_future.detach()
+                ctx_len = p1 - p0
+                idx_ctx_1d = build_temporal_patch_indices(P_, 0, ctx_len)
+                if args.trajmode == "traj":
+                    T_tgt = f1 - f0
+                    idx_tgt_1d = build_temporal_patch_indices(
+                        P_, ctx_len, ctx_len + T_tgt
+                    )
                 else:
-                    feats_task_in = feats_eval_full[:, p0:p1, ...].contiguous()
+                    T_tgt = ctx_len
+                    idx_tgt_1d = idx_ctx_1d
+                masks_x = repeat_indices_for_batch(
+                    idx_ctx_1d.long(), B_, device=x_seq.device
+                )
+                masks_y = repeat_indices_for_batch(
+                    idx_tgt_1d.long(), B_, device=x_seq.device
+                )
+                x_ctxt = x_seq.gather(
+                    dim=1, index=masks_x.unsqueeze(-1).expand(-1, -1, D_)
+                )
+                ext = build_thinkjepa_guidance_inputs(
+                    extras=extras,
+                    args=args,
+                    device=x_seq.device,
+                )
 
-                # joint_pred at eval
+                with build_amp_autocast(enabled=use_amp):
+                    y_future_seq = predictor(x_ctxt, masks_x, masks_y, ext=ext)
+                    y_future = y_future_seq.view(B_, T_tgt, P_, D_)
+                tgt_future = (
+                    feats_gt_full[:, f0:f1, ...].detach()
+                    if args.trajmode == "traj"
+                    else feats_gt_full[:, p0:p1, ...].detach()
+                )
+                pred_metrics_eval = compute_predicted_latent_metrics(
+                    y_future, tgt_future
+                )
+                pred_metric_valid = True
+                feats_task_in = y_future.detach()
+
+                # Match training: observed latents plus predicted future latents.
                 if (
                     getattr(args, "joint_pred", False)
                     and args.trajmode == "traj"
@@ -3131,7 +3858,9 @@ def main(args):
                         dim=1,
                     ).contiguous()
 
-                xyz_cam_slice = xyz_cam[:, f0:f1, ...].contiguous()
+                xyz_cam_slice = xyz_cam[:, p1 - 1 : p1, ...].expand(
+                    -1, Tpred, -1, -1
+                ).contiguous()
                 right_ref_cam = xyz_cam_slice[..., right_idx, :]
                 left_ref_cam = xyz_cam_slice[..., left_idx, :]
 
@@ -3161,23 +3890,23 @@ def main(args):
                 loss, avg_dist, final_dist, acc = compute_trajectory_loss_and_accuracy(
                     pred_world, xyz_world_slice, Crit, thr=0.05
                 )
-                test_loss_sum += float(loss.item())
-                test_acc_sum += float(acc)
-                test_avgdist_sum += float(avg_dist.mean().item())
-                test_finaldist_sum += float(final_dist.mean().item())
-                test_count += 1
+                batch_sample_count = int(xyz_world_slice.shape[0])
+                test_loss_sum += float(loss.item()) * batch_sample_count
+                test_acc_sum += float(acc) * batch_sample_count
+                test_avgdist_sum += float(avg_dist.mean().item()) * batch_sample_count
+                test_finaldist_sum += float(final_dist.mean().item()) * batch_sample_count
+                test_count += batch_sample_count
+                eval_batches_seen += 1
                 if pred_metric_valid:
                     for key in test_lat_metric_sums:
                         test_lat_metric_sums[key] += float(
                             pred_metrics_eval[key].item()
-                        )
-                    test_pred_count += 1
+                        ) * batch_sample_count
+                    test_pred_count += batch_sample_count
 
                 # ---------- Visualization ----------
                 if (
-                    visualize_flag
-                    and epoch % 10 == 0
-                    and is_primary_process(rank)
+                    capture_visuals_this_epoch
                     and vis_batch_count < max_vis_batches
                 ):
                     composed = render_bimanual_rollout_panel(
@@ -3195,6 +3924,12 @@ def main(args):
                     )
                     composed_pool.append(composed)
                     vis_batch_count += 1
+                if (
+                    int(getattr(args, "max_eval_batches", 0)) > 0
+                    and eval_batches_seen >= int(getattr(args, "max_eval_batches", 0))
+                ):
+                    break
+        eval_dt = time.time() - eval_t0
 
         # ---------- Save composed video (both modes) ----------
         if "composed_pool" in locals() and len(composed_pool) > 0:
@@ -3209,14 +3944,77 @@ def main(args):
             del composed_pool
 
         dt = time.time() - t0
-        avg_train_loss = train_loss_sum / max(train_count, 1)
-        avg_train_acc = train_acc_sum / max(train_count, 1)
-        avg_train_avgdist = train_avgdist_sum / max(train_count, 1)
-        avg_train_finaldist = train_finaldist_sum / max(train_count, 1)
-        avg_test_loss = test_loss_sum / max(test_count, 1)
-        avg_test_acc = test_acc_sum / max(test_count, 1)
-        avg_test_avgdist = test_avgdist_sum / max(test_count, 1)
-        avg_test_finaldist = test_finaldist_sum / max(test_count, 1)
+        global_train_count = distributed_sum_int(train_count, ddp=ddp)
+        global_test_count = distributed_sum_int(test_count, ddp=ddp)
+        if global_train_count <= 0:
+            raise RuntimeError(
+                f"epoch {epoch + 1} produced zero valid training batches; refusing "
+                "to save a checkpoint from skipped/invalid cache samples"
+            )
+        if global_test_count <= 0:
+            raise RuntimeError(
+                f"epoch {epoch + 1} produced zero valid evaluation batches; refusing "
+                "to report zero-valued metrics"
+            )
+        peak_allocated_bytes = (
+            float(torch.cuda.max_memory_allocated(device))
+            if device.type == "cuda"
+            else 0.0
+        )
+        peak_reserved_bytes = (
+            float(torch.cuda.max_memory_reserved(device))
+            if device.type == "cuda"
+            else 0.0
+        )
+        if ddp:
+            distributed_perf = torch.tensor(
+                [peak_allocated_bytes, peak_reserved_bytes, train_dt, eval_dt],
+                dtype=torch.float64,
+                device=device,
+            )
+            dist.all_reduce(distributed_perf, op=dist.ReduceOp.MAX)
+            (
+                peak_allocated_bytes,
+                peak_reserved_bytes,
+                train_dt,
+                eval_dt,
+            ) = distributed_perf.tolist()
+        global_train_samples_per_sec = global_train_count / max(train_dt, 1e-9)
+        if is_primary_process(rank):
+            print(
+                f"[PERF] epoch={epoch + 1} train_batches={step} "
+                f"train_samples={global_train_count} train_time={train_dt:.3f}s "
+                f"train_samples_per_sec={global_train_samples_per_sec:.3f} "
+                f"eval_batches={eval_batches_seen} eval_samples={global_test_count} "
+                f"eval_time={eval_dt:.3f}s "
+                f"peak_allocated_gib={peak_allocated_bytes / (1024 ** 3):.3f} "
+                f"peak_reserved_gib={peak_reserved_bytes / (1024 ** 3):.3f}",
+                flush=True,
+            )
+        avg_train_loss = distributed_average_from_sum_count(
+            train_loss_sum, train_count, ddp=ddp
+        )
+        avg_train_acc = distributed_average_from_sum_count(
+            train_acc_sum, train_count, ddp=ddp
+        )
+        avg_train_avgdist = distributed_average_from_sum_count(
+            train_avgdist_sum, train_count, ddp=ddp
+        )
+        avg_train_finaldist = distributed_average_from_sum_count(
+            train_finaldist_sum, train_count, ddp=ddp
+        )
+        avg_test_loss = distributed_average_from_sum_count(
+            test_loss_sum, test_count, ddp=ddp
+        )
+        avg_test_acc = distributed_average_from_sum_count(
+            test_acc_sum, test_count, ddp=ddp
+        )
+        avg_test_avgdist = distributed_average_from_sum_count(
+            test_avgdist_sum, test_count, ddp=ddp
+        )
+        avg_test_finaldist = distributed_average_from_sum_count(
+            test_finaldist_sum, test_count, ddp=ddp
+        )
         avg_train_lat_metrics = {
             key: distributed_average_from_sum_count(val, train_pred_count, ddp=ddp)
             for key, val in train_lat_metric_sums.items()
@@ -3226,24 +4024,6 @@ def main(args):
             for key, val in test_lat_metric_sums.items()
         }
 
-        avg_train_loss = distributed_mean_scalar(
-            avg_train_loss, ddp=ddp, world_size=world_size
-        )
-        avg_train_acc = distributed_mean_scalar(avg_train_acc, ddp=ddp, world_size=world_size)
-        avg_train_avgdist = distributed_mean_scalar(
-            avg_train_avgdist, ddp=ddp, world_size=world_size
-        )
-        avg_train_finaldist = distributed_mean_scalar(
-            avg_train_finaldist, ddp=ddp, world_size=world_size
-        )
-        avg_test_loss = distributed_mean_scalar(avg_test_loss, ddp=ddp, world_size=world_size)
-        avg_test_acc = distributed_mean_scalar(avg_test_acc, ddp=ddp, world_size=world_size)
-        avg_test_avgdist = distributed_mean_scalar(
-            avg_test_avgdist, ddp=ddp, world_size=world_size
-        )
-        avg_test_finaldist = distributed_mean_scalar(
-            avg_test_finaldist, ddp=ddp, world_size=world_size
-        )
 
         if is_primary_process(rank):
             train_pred_loss_str = (
@@ -3304,29 +4084,19 @@ def main(args):
                 )
             )
 
-        latest_path = out_dir / "ckpt_latest.pt"
-        if is_primary_process(rank):
-            try:
-                save_training_checkpoint(
-                    latest_path,
-                    epoch + 1,
-                    cls_model,
-                    optimizer,
-                    logs["best"],
-                    predictor=predictor,
-                    optimizer_pred=optimizer_pred,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    args=args,
-                )
-                cleanup_legacy_epoch_checkpoints(out_dir)
-            except Exception as ex:
-                print(
-                    f"[WARN] failed to save latest checkpoint {latest_path}: {ex}",
-                    flush=True,
-                )
+        # Advance the scheduler before checkpointing so a resumed run uses the
+        # same learning rate as an uninterrupted next epoch.
+        scheduler.step()
 
-        is_best = avg_test_avgdist < best_ade
+        latest_path = out_dir / "ckpt_latest.pt"
+        checkpoint_selection = str(
+            getattr(args, "checkpoint_selection", "best")
+        ).lower()
+        # ``best`` and its ``validation`` compatibility alias select by
+        # validation ADE; ``last`` always advances to the current epoch.
+        is_best = checkpoint_should_update(
+            checkpoint_selection, avg_test_avgdist, best_ade
+        )
         if is_primary_process(rank) and is_best:
             best_ade = avg_test_avgdist
             best_epoch = epoch + 1
@@ -3334,6 +4104,7 @@ def main(args):
             best_blob = {
                 "epoch": best_epoch,
                 "ade": best_ade,
+                "fde": avg_test_finaldist,
                 "loss": avg_test_loss,
                 "pred_loss": avg_test_lat_metrics["pred_loss"],
                 "pred_latent_dist": avg_test_lat_metrics["pred_latent_dist"],
@@ -3344,28 +4115,56 @@ def main(args):
                     "pred_latent_cosine_distance"
                 ],
                 "ckpt": str(best_path),
+                "selection_mode": checkpoint_selection,
+                "selection_split": (
+                    "validation"
+                    if checkpoint_selection in {"best", "validation"}
+                    else "final_epoch"
+                ),
+                "selection_metric": (
+                    "val_avg_dist"
+                    if checkpoint_selection in {"best", "validation"}
+                    else "none"
+                ),
             }
-            try:
-                save_training_checkpoint(
-                    best_path,
-                    best_epoch,
-                    cls_model,
-                    optimizer,
-                    best_blob,
-                    predictor=predictor,
-                    optimizer_pred=optimizer_pred,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    args=args,
-                )
-                logs["best"] = best_blob
-            except Exception as ex:
-                print(
-                    f"[WARN] failed to save best checkpoint {best_path}: {ex}",
-                    flush=True,
-                )
+            save_training_checkpoint(
+                best_path,
+                best_epoch,
+                cls_model,
+                optimizer,
+                best_blob,
+                predictor=predictor,
+                optimizer_pred=optimizer_pred,
+                scheduler=scheduler,
+                scaler=scaler,
+                args=args,
+            )
+            logs["best"] = best_blob
 
+        # Save latest only after this epoch's selection decision has updated
+        # ``logs["best"]``.  Resume restores that blob from ckpt_latest, so
+        # writing latest first would roll metrics.best back to the previous
+        # epoch (or to the initial inf sentinel) on the next launch.
         if is_primary_process(rank):
+            save_training_checkpoint(
+                latest_path,
+                epoch + 1,
+                cls_model,
+                optimizer,
+                logs["best"],
+                predictor=predictor,
+                optimizer_pred=optimizer_pred,
+                scheduler=scheduler,
+                scaler=scaler,
+                args=args,
+            )
+            cleanup_legacy_epoch_checkpoints(out_dir)
+
+        state_write_error = ""
+        if is_primary_process(rank):
+            if is_best:
+                for previous_epoch in logs["epochs"]:
+                    previous_epoch["is_best"] = False
             logs["epochs"].append(
                 {
                     "epoch": epoch + 1,
@@ -3397,37 +4196,44 @@ def main(args):
                     "val_avg_dist": avg_test_avgdist,
                     "val_final_dist": avg_test_finaldist,
                     "time_sec": dt,
+                    "train_time_sec": train_dt,
+                    "eval_time_sec": eval_dt,
+                    "train_samples_per_sec": global_train_samples_per_sec,
+                    "peak_allocated_gib": peak_allocated_bytes / (1024 ** 3),
+                    "peak_reserved_gib": peak_reserved_bytes / (1024 ** 3),
                     "ckpt": str(latest_path),
                     "is_best": is_best,
                 }
             )
             try:
-                write_json_atomic(logs, metrics_json_path)
-            except Exception as ex:
-                print(
-                    f"[WARN] failed to save metrics json {metrics_json_path}: {ex}",
-                    flush=True,
+                write_json_atomic(
+                    build_training_logs(logs, out_dir), metrics_json_path
                 )
-            try:
                 write_json_atomic(
                     {
                         "current_epoch": epoch + 1,
                         "target_epochs": int(num_epoch),
-                        "latest_ckpt": str(latest_path),
+                        "latest_ckpt": portable_output_ref(latest_path, out_dir),
                         "best_epoch": int(best_epoch),
-                        "best_ckpt": str(out_dir / "ckpt_best.pt"),
+                        "best_ckpt": portable_output_ref(
+                            out_dir / "ckpt_best.pt", out_dir
+                        ),
                     },
                     out_dir / "training_state.json",
                 )
                 write_text_file(f"{epoch + 1}\n", out_dir / "latest_epoch.txt")
             except Exception as ex:
-                print(
-                    f"[WARN] failed to save training state under {out_dir}: {ex}",
-                    flush=True,
+                state_write_error = (
+                    f"failed to durably save epoch metrics/state under {out_dir}: {ex}"
                 )
         if ddp:
+            shared_error = [state_write_error]
+            torch.distributed.broadcast_object_list(shared_error, src=0)
+            if shared_error[0]:
+                raise RuntimeError(shared_error[0])
             torch.distributed.barrier()
-        scheduler.step()
+        elif state_write_error:
+            raise RuntimeError(state_write_error)
 
     if is_primary_process(rank):
         latent_plot_path = plot_latent_metric_curves(
@@ -3436,16 +4242,20 @@ def main(args):
         md_path = (
             Path(getattr(args, "results_md"))
             if getattr(args, "results_md", None)
-            else (out_dir / "test_results.md")
+            else (out_dir / "validation_results.md")
         )
         write_markdown_experiment_report(
             md_path=md_path,
             args=args,
-            logs=logs,
+            logs=build_training_logs(logs, out_dir),
             train_size=train_size,
             test_size=test_size,
             artifact_paths={
-                "latent_metric_plot": str(latent_plot_path) if latent_plot_path else ""
+                "latent_metric_plot": (
+                    portable_output_ref(latent_plot_path, out_dir)
+                    if latent_plot_path
+                    else ""
+                )
             },
         )
         print(f"[REPORT] markdown saved to: {md_path}")
@@ -3454,9 +4264,13 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data_dir", default=DEFAULT_EGODEX_PART2_HF_DIR
+        "--data_dir", default="", help="explicit local HDF5/MP4 supervision root"
     )
-    parser.add_argument("--num_episodes", default=1)
+    parser.add_argument(
+        "--split_meta",
+        default="",
+        help="meta.json proving group-aware, hash-locked train/validation manifests",
+    )
     parser.add_argument("--output_mp4", default="visualize/output")
     parser.add_argument(
         "--output_dir",
@@ -3468,14 +4282,14 @@ if __name__ == "__main__":
         "--results_md",
         type=str,
         default=None,
-        help="optional markdown summary path; default: <output_dir>/test_results.md",
+        help="optional markdown summary path; default: <output_dir>/validation_results.md",
     )
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument(
         "--auto_resume",
         action="store_true",
-        help="resume from ckpt_latest.pt under --output_dir, or fall back to the latest legacy ckpt_epoch*.pt, before continuing to --epochs",
+        help="resume from ckpt_latest.pt under --output_dir, or fall back to the latest epoch-numbered checkpoint, before continuing to --epochs",
     )
     parser.add_argument(
         "--resume_ckpt",
@@ -3483,18 +4297,39 @@ if __name__ == "__main__":
         default="",
         help="resume from an explicit checkpoint path instead of auto-discovering the latest epoch checkpoint",
     )
-    parser.add_argument("--no_amp", action="store_true")
     parser.add_argument(
-        "--skip_nonfinite_loss",
-        action="store_true",
-        help="skip train batches with non-finite task/predictor loss instead of aborting the run",
+        "--checkpoint_selection",
+        choices=["best", "last", "validation"],
+        default="best",
+        help=(
+            "checkpoint policy; 'best' selects the lowest validation ADE, "
+            "'last' keeps the final epoch, and 'validation' is a compatibility "
+            "alias for 'best'"
+        ),
     )
+    parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--max_train_batches",
+        type=int,
+        default=0,
+        help=(
+            "limit training batches for an isolated --debug smoke test; requires "
+            "--epochs 1, --checkpoint_selection last, and --max_eval_batches > 0"
+        ),
+    )
+    parser.add_argument(
+        "--max_eval_batches",
+        type=int,
+        default=0,
+        help=(
+            "limit evaluation batches for an isolated --debug smoke test; requires "
+            "--epochs 1, --checkpoint_selection last, and --max_train_batches > 0"
+        ),
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--grad_accum", type=int, default=1)
-    parser.add_argument(
-        "--trajmode", type=str, default="track", choices=["track", "traj"]
-    )
+    parser.add_argument("--trajmode", type=str, default="traj", choices=["traj"])
     parser.add_argument("--past_T", type=int, default=32)
     parser.add_argument("--future_T", type=int, default=32)
     parser.add_argument(
@@ -3503,29 +4338,23 @@ if __name__ == "__main__":
         default=1,
         help="subsample temporal dimension by this stride before past/future slicing",
     )
-    parser.add_argument("--temporal_causal_attn", action="store_true")
+    # Every ThinkJEPA rollout layer uses causal attention.
+    parser.set_defaults(temporal_causal_attn=True)
 
     parser.add_argument(
         "--backbone",
         type=str,
         default="vjepa",
         choices=["vjepa"],
-        help="choose backbone for the public release; only vjepa is supported",
+        help="choose the backbone; only vjepa is supported",
     )
 
-    # old flag (kept for compatibility)
-    parser.add_argument(
-        "--vjepa_predictor",
-        action="store_true",
-        help="(deprecated) kept for compatibility; use --predictor instead.",
-    )
-    # NEW: unified predictor selector
     parser.add_argument(
         "--predictor",
         type=str,
-        default="none",
-        choices=["none", "tiny", "official", "thinkjepa"],
-        help="choose predictor head: none | tiny (paper) | official (V-JEPA predictor) | thinkjepa (cortex-guided ThinkJEPA rollout head)",
+        default="thinkjepa",
+        choices=["thinkjepa"],
+        help="use the cortex-guided ThinkJEPA predictor",
     )
 
     parser.add_argument("--optimize_together_downstream", action="store_true")
@@ -3538,30 +4367,41 @@ if __name__ == "__main__":
         default="none",
         help="how to add reference joint back to prediction (none|right|left|both|avg|perhand)",
     )
-    # (NEW) joint_pred flag
     parser.add_argument(
         "--joint_pred",
         action="store_true",
-        help="feed both past and future features into the MLP head (enabled only in traj mode with Tpred>0)",
+        help=(
+            "feed observed latents and predictor-generated future latents into "
+            "the trajectory head; ground-truth future latents remain targets only"
+        ),
     )
-    # (NEW) NPZ / cache settings (used only for V-JEPA)
     parser.add_argument(
         "--camera_mode",
         type=str,
-        default="auto",
-        choices=["auto", "egodex", "egoexo"],
-        help="camera source for cache loader: auto prefers egoexo_cam_* when present; egoexo forces EgoExo intrinsics/extrinsics; egodex uses legacy cam_ext/cam_int",
-    )
-    parser.add_argument(
-        "--use_npz_cache",
-        action="store_true",
-        help="read samples from cached .npz files (including vjepa_feats, etc.; V-JEPA only)",
+        default="egodex",
+        choices=["egodex"],
+        help=(
+            "camera source for the causal cache loader; trajectory/camera labels "
+            "come only from the independently validated EgoDex HDF5 root"
+        ),
     )
     parser.add_argument(
         "--cache_dir",
         type=str,
-        default=DEFAULT_EGODEX_PART2_HF_DIR,
-        help="root directory of the NPZ cache (should match your extraction output; V-JEPA only)",
+        default="",
+        help="explicit root of the immutable causal NPZ feature cache",
+    )
+    parser.add_argument(
+        "--cache_validation_report",
+        type=str,
+        default="",
+        help="full_validation.json for --cache_dir; defaults to its parent directory",
+    )
+    parser.add_argument(
+        "--cache_validation_marker",
+        type=str,
+        default="",
+        help="VALIDATED_SUCCESS marker for --cache_dir; defaults to its parent directory",
     )
     parser.add_argument(
         "--preload_cache_to_memory",
@@ -3573,39 +4413,14 @@ if __name__ == "__main__":
         "--no_preload_cache_to_memory",
         dest="preload_cache_to_memory",
         action="store_false",
-        help="disable eager full-cache RAM preload even when using Hugging Face cache paths",
+        help="disable eager full-cache RAM preload",
     )
     parser.set_defaults(preload_cache_to_memory=None)
-    parser.add_argument(
-        "--skip_vjepa",
-        action="store_true",
-        help="skip V-JEPA initialization and forward when cached vjepa_feats are available",
-    )
-    # Optional sharding
-    parser.add_argument("--shards", type=int, default=None, help="total number of data shards")
-    parser.add_argument("--shards_id", type=int, default=0, help="current shard id")
-    parser.add_argument(
-        "--train_ratio",
-        type=float,
-        default=0.9,
-        help="auto split ratio for train set (test uses remaining samples)",
-    )
-    parser.add_argument(
-        "--split_seed",
-        type=int,
-        default=42,
-        help="random seed for train/test split shuffling",
-    )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
         help="random seed for model init / dataloader / training runtime",
-    )
-    parser.add_argument(
-        "--no_split_shuffle",
-        action="store_true",
-        help="disable shuffling before train/test split",
     )
     parser.add_argument(
         "--num_workers",
@@ -3650,61 +4465,41 @@ if __name__ == "__main__":
         "--train_manifest",
         type=str,
         default="",
-        help="optional fixed train path manifest (.txt), one absolute sample path per line",
+        help=(
+            "portable-v1 train manifest containing canonical paths relative "
+            "to --cache_dir"
+        ),
     )
     parser.add_argument(
         "--test_manifest",
+        "--val_manifest",
+        dest="test_manifest",
         type=str,
         default="",
-        help="optional fixed test path manifest (.txt), one absolute sample path per line",
+        help=(
+            "portable-v1 validation manifest containing canonical paths relative "
+            "to --cache_dir"
+        ),
     )
     parser.add_argument(
         "--no_fast_hdf5_index",
         action="store_true",
         help="disable fast full-scan index mode (fast mode avoids opening every hdf5 file just to build split)",
     )
-    parser.add_argument(
-        "--thinkjepa_use_cache_ext",
-        dest="thinkjepa_use_cache_ext",
-        action="store_true",
-        help="for predictor=thinkjepa, load VLM conditioning features from cache_dir by sample path",
-    )
-    parser.add_argument(
-        "--no_thinkjepa_use_cache_ext",
-        dest="thinkjepa_use_cache_ext",
-        action="store_false",
-        help="disable loading VLM cache ext for ThinkJEPA predictor",
-    )
     parser.set_defaults(thinkjepa_use_cache_ext=True)
-    parser.add_argument(
-        "--thinkjepa_use_vlm_merge",
-        dest="thinkjepa_use_vlm_merge",
-        action="store_true",
-        help="enable VLM FiLM merge in ThinkJEPA predictor",
-    )
-    parser.add_argument(
-        "--no_thinkjepa_use_vlm_merge",
-        dest="thinkjepa_use_vlm_merge",
-        action="store_false",
-        help="disable VLM FiLM merge (direct ViT conditioning baseline)",
-    )
+    # ThinkJEPA conditions the predictor through the VLM merger.
     parser.set_defaults(thinkjepa_use_vlm_merge=True)
-    parser.add_argument(
-        "--thinkjepa_direct_vit_condition",
-        action="store_true",
-        help="shortcut ablation: disable ThinkJEPA VLM merge + disable cache ext + force thinkjepa_vlm_source=none",
-    )
     parser.add_argument(
         "--vlm_pad_old_to",
         type=int,
-        default=480,
-        help="pad/truncate token length for vlm_old when loading cache ext",
+        default=1280,
+        help="lossless padding capacity for vlm_old; overflow fails closed",
     )
     parser.add_argument(
         "--vlm_pad_new_to",
         type=int,
-        default=15,
-        help="pad/truncate token length for vlm_new when loading cache ext",
+        default=16,
+        help="lossless padding capacity for vlm_new/token_ids; overflow fails closed",
     )
     parser.add_argument(
         "--thinkjepa_vlm_old_dim",
@@ -3717,33 +4512,6 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="input dim of thinkjepa vlm_new projection (0=auto infer from cache/extras, fallback 3584)",
-    )
-    parser.add_argument(
-        "--thinkjepa_vlm_source",
-        type=str,
-        default="both",
-        choices=["both", "old", "new", "none"],
-        help="which VLM cache source to use for ThinkJEPA conditioning",
-    )
-    parser.add_argument(
-        "--thinkjepa_vlm_layer_selector",
-        type=str,
-        default="last",
-        choices=["last", "mid", "index", "all"],
-        help="which VLM layer(s) to use for ThinkJEPA conditioning",
-    )
-    parser.add_argument(
-        "--thinkjepa_vlm_layer_index",
-        type=int,
-        default=-1,
-        help="specific VLM layer index when thinkjepa_vlm_layer_selector=index",
-    )
-    parser.add_argument(
-        "--thinkjepa_vlm_cond_mode",
-        type=str,
-        default="film",
-        choices=["film", "crossattn", "adaln"],
-        help="conditioning mechanism for ThinkJEPA VLM merge: film | crossattn | adaln",
     )
     parser.add_argument(
         "--thinkjepa_drop_thinking_tokens",
@@ -3810,13 +4578,6 @@ if __name__ == "__main__":
         help="print ThinkJEPA conditioning debug info",
     )
     parser.add_argument(
-        "--zero_visual_input",
-        action="store_true",
-        help="zero out V-JEPA visual context/features before predictor and traj head; useful for VLM-only baselines",
-    )
-
-    # NEW: maximum number of visualized batches
-    parser.add_argument(
         "--max_visual_batches",
         type=int,
         default=10,
@@ -3824,12 +4585,36 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    if not (0.0 < float(args.train_ratio) < 1.0):
-        raise ValueError(f"--train_ratio must be in (0,1), got {args.train_ratio}")
     if int(args.temporal_stride) <= 0:
         raise ValueError(
             f"--temporal_stride must be positive, got {args.temporal_stride}"
         )
+    if int(args.max_train_batches) < 0 or int(args.max_eval_batches) < 0:
+        raise ValueError("--max_train_batches/--max_eval_batches must be >= 0")
+    if int(args.grad_accum) <= 0:
+        raise ValueError("--grad_accum must be positive")
+    args.smoke_only = bool(args.max_train_batches or args.max_eval_batches)
+    if args.smoke_only:
+        if not bool(args.debug):
+            raise ValueError(
+                "truncated train/eval loops are smoke-only and require --debug"
+            )
+        if int(args.epochs) != 1:
+            raise ValueError("smoke-only batch limits require --epochs 1")
+        if str(args.checkpoint_selection).strip().lower() != "last":
+            raise ValueError(
+                "smoke-only batch limits require --checkpoint_selection last"
+            )
+        if int(args.max_train_batches) <= 0 or int(args.max_eval_batches) <= 0:
+            raise ValueError(
+                "smoke-only runs must bound both --max_train_batches and "
+                "--max_eval_batches"
+            )
+        if int(args.max_train_batches) % int(args.grad_accum) != 0:
+            raise ValueError(
+                "--max_train_batches must be divisible by --grad_accum so a smoke "
+                "run cannot checkpoint a partially accumulated optimizer step"
+            )
     if int(args.thinkjepa_think_drop_prefix_len) < 0:
         raise ValueError(
             f"--thinkjepa_think_drop_prefix_len must be >= 0, got {args.thinkjepa_think_drop_prefix_len}"
@@ -3839,10 +4624,6 @@ if __name__ == "__main__":
             f"--thinkjepa_think_drop_suffix_len must be >= 0, got {args.thinkjepa_think_drop_suffix_len}"
         )
 
-    if bool(getattr(args, "thinkjepa_direct_vit_condition", False)):
-        args.thinkjepa_use_vlm_merge = False
-        args.thinkjepa_use_cache_ext = False
-        args.thinkjepa_vlm_source = "none"
     if bool(getattr(args, "thinkjepa_drop_thinking_tokens", False)):
         has_ids = any(
             str(getattr(args, k, "")).strip()
@@ -3857,12 +4638,6 @@ if __name__ == "__main__":
                 "token ids (--thinkjepa_think_start_ids/--thinkjepa_think_end_ids/--thinkjepa_think_drop_ids) "
                 "or positional (--thinkjepa_think_drop_prefix_len/--thinkjepa_think_drop_suffix_len)"
             )
-
-    # if getattr(args, "vjepa_predictor", False) and (args.predictor == "none"):
-    #     args.predictor = "tiny"
-    if args.use_npz_cache and args.backbone == "vjepa":
-        # Using cached features usually implies skipping the online V-JEPA forward pass
-        args.skip_vjepa = True
 
     main(args)
     shutdown_distributed_runtime(bool(getattr(args, "ddp", False)))

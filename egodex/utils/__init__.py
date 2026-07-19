@@ -11,4 +11,4 @@
 #
 # See LICENSE and NOTICE for release terms.
 #
-"""Utility helpers for the ThinkJEPA EgoDex release subset."""
+"""Utility helpers for ThinkJEPA EgoDex data."""

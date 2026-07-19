@@ -19,7 +19,12 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 A simple PyTorch dataset using torchcodec for MP4 files and h5py for HDF5 files.
 """
 
+# The standalone dataset module makes the repository root importable first.
+# ruff: noqa: E402
+
 import glob
+import hashlib
+import json
 import os
 import random
 import re
@@ -38,7 +43,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from cache_train.hf_egodex import resolve_egodex_data_reference, rewrite_manifest_paths_for_release
+from cache_train.runtime_paths import (
+    resolve_egodex_data_reference,
+    rewrite_manifest_paths,
+)
 
 # from torchcodec.decoders import VideoDecoder
 from egodex.utils.trajectory_data_utils import index_episode_files
@@ -46,12 +54,6 @@ from egodex.utils.skeleton_tfs import LEFT_FINGERS, RIGHT_FINGERS, WRISTS
 
 # loads only the wrist transforms by default. change as desired.
 DEFAULT_QUERY_TFS = WRISTS
-
-from torch.utils.data._utils.collate import default_collate
-
-KEY_IMG_IDX = 8
-KEY_WORLD_IDX = 2
-TIME_FIELD_IDX = [0, 1, 2, 3, 4, 6, 8, 10]  # These fields use time T as their first dimension
 
 K = np.array(
     [
@@ -63,8 +65,32 @@ K = np.array(
 )
 
 _QWEN_CACHE_NAME_RE = re.compile(
-    r"^(?P<stem>.+?)_L\d+_nf\d+_res\d+_new\d+_s\d+of\d+$"
+    r"^(?P<stem>.+?)_L\d+_nf\d+_res\d+_new\d+_s\d+of\d+(?:_cv\d+)?$"
 )
+
+CAUSAL_CACHE_SCHEMA_VERSION = 2
+CAUSAL_CACHE_SCHEMA_NAME = "thinkjepa.causal_split.v2"
+CAUSAL_VLM_OBSERVATION_POLICY = "observed_past_exact_frames"
+CAUSAL_CACHE_EXTRACTOR_VERSION = "2.0.5"
+CAUSAL_CACHE_SAMPLING_STRATEGY = "raw_index_midpoint_disjoint_uniform_v3"
+CAUSAL_FEATURE_FORBIDDEN_KEYS = {
+    "vjepa_feats",
+    "frame_indices",
+    "xyz_cam",
+    "R_cam",
+    "xyz_world",
+    "R_world",
+    "tfs_in_cam",
+    "tfs",
+    "cam_ext",
+    "cam_int",
+    "confs",
+    "lang_instruct",
+    "path",
+    "video_path",
+    "raw_video_path",
+    "total_frames",
+}
 
 # Keep NPZ fallback supervision joint order aligned with thinker_train.py QUERY_TFS.
 NPZ_TARGET_QUERY_TFS = (
@@ -150,85 +176,201 @@ def _maybe_decode_bfloat16_cache_array(x):
         return arr
 
 
-def _save_npz_atomic_archive(npz_path: str, payload: dict[str, Any], save_mode: str = "raw") -> None:
-    tmp_path = f"{npz_path}.tmp.{os.getpid()}.{random.randint(0, 1_000_000)}.npz"
-    if save_mode == "raw":
-        np.savez(tmp_path, **payload)
-    else:
-        np.savez_compressed(tmp_path, **payload)
-    os.replace(tmp_path, npz_path)
+def _cache_scalar(x, default=None):
+    if x is None:
+        return default
+    arr = np.asarray(x)
+    if arr.size == 0:
+        return default
+    try:
+        value = arr.reshape(-1)[0]
+        return value.item() if hasattr(value, "item") else value
+    except Exception:
+        return default
 
 
-def _leading_dimension(x):
-    import numpy as np, torch
-
-    return (
-        int(x.shape[0])
-        if isinstance(x, (np.ndarray, torch.Tensor)) and x.ndim >= 1
-        else None
+def validate_causal_cache_payload(payload: dict[str, Any], *, path: str = "<cache>") -> None:
+    """Fail closed when a feature cache cannot prove observation-only encoding."""
+    forbidden = sorted(
+        (set(payload) & CAUSAL_FEATURE_FORBIDDEN_KEYS)
+        | {key for key in payload if key.startswith("egoexo_")}
     )
+    if forbidden:
+        raise ValueError(
+            f"causal feature cache contains supervision/legacy keys at {path}: {forbidden}"
+        )
+    version = int(_cache_scalar(payload.get("cache_schema_version"), -1))
+    name = str(_cache_scalar(payload.get("cache_schema_name"), ""))
+    policy = str(_cache_scalar(payload.get("vlm_observation_policy"), ""))
+    if version != CAUSAL_CACHE_SCHEMA_VERSION or name != CAUSAL_CACHE_SCHEMA_NAME:
+        raise ValueError(
+            f"unsafe/unknown cache schema at {path}: name={name!r} version={version}; "
+            f"expected {CAUSAL_CACHE_SCHEMA_NAME!r} v{CAUSAL_CACHE_SCHEMA_VERSION}"
+        )
+    if policy != CAUSAL_VLM_OBSERVATION_POLICY:
+        raise ValueError(
+            f"unsafe VLM observation policy at {path}: {policy!r}; "
+            f"expected {CAUSAL_VLM_OBSERVATION_POLICY!r}"
+        )
+    source_video_text = str(
+        _cache_scalar(payload.get("source_video_relpath"), "")
+    )
+    source_video_relpath = Path(source_video_text)
+    if (
+        not source_video_text
+        or "\x00" in source_video_text
+        or "\\" in source_video_text
+        or not source_video_relpath.parts
+        or source_video_relpath.is_absolute()
+        or ".." in source_video_relpath.parts
+        or source_video_relpath.as_posix() != source_video_text
+        or source_video_relpath.suffix.lower() != ".mp4"
+    ):
+        raise ValueError(
+            f"causal cache has an unsafe source_video_relpath at {path}: "
+            f"{source_video_relpath}"
+        )
+    if path != "<cache>":
+        expected_suffix = source_video_relpath.with_suffix(".npz").parts
+        actual_parts = Path(path).parts
+        if tuple(actual_parts[-len(expected_suffix) :]) != tuple(expected_suffix):
+            raise ValueError(
+                "cache archive path does not match its bound source video: "
+                f"archive={path} source={source_video_relpath}"
+            )
+    extractor_version = str(_cache_scalar(payload.get("extractor_version"), ""))
+    if extractor_version != CAUSAL_CACHE_EXTRACTOR_VERSION:
+        raise ValueError(
+            f"stale/unknown causal extractor at {path}: {extractor_version!r}; "
+            f"expected {CAUSAL_CACHE_EXTRACTOR_VERSION!r}"
+        )
+    sampling_strategy = str(_cache_scalar(payload.get("sampling_strategy"), ""))
+    if sampling_strategy != CAUSAL_CACHE_SAMPLING_STRATEGY:
+        raise ValueError(
+            f"stale/unknown sampling strategy at {path}: {sampling_strategy!r}; "
+            f"expected {CAUSAL_CACHE_SAMPLING_STRATEGY!r}"
+        )
+    configuration_json = str(_cache_scalar(payload.get("configuration_json"), ""))
+    configuration_fingerprint = str(
+        _cache_scalar(payload.get("configuration_fingerprint"), "")
+    )
+    cache_fingerprint = str(_cache_scalar(payload.get("cache_config_fingerprint"), ""))
+    computed_fingerprint = hashlib.sha256(configuration_json.encode("utf-8")).hexdigest()
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", configuration_fingerprint)
+        or configuration_fingerprint != cache_fingerprint
+        or configuration_fingerprint != computed_fingerprint
+    ):
+        raise ValueError(f"configuration fingerprint mismatch at {path}")
+    try:
+        configuration = json.loads(configuration_json)
+    except Exception as exc:
+        raise ValueError(f"invalid configuration_json at {path}: {exc}") from exc
+    if (
+        configuration.get("schema_name") != CAUSAL_CACHE_SCHEMA_NAME
+        or int(configuration.get("schema_version", -1)) != CAUSAL_CACHE_SCHEMA_VERSION
+        or configuration.get("extractor_version") != CAUSAL_CACHE_EXTRACTOR_VERSION
+        or configuration.get("sampling_strategy") != CAUSAL_CACHE_SAMPLING_STRATEGY
+        or configuration.get("causality_mode") != "observed_past"
+    ):
+        raise ValueError(f"configuration contract mismatch at {path}")
+    qwen_config = configuration.get("qwen", {})
+    if (
+        qwen_config.get("input_scope") != "exact_decoded_past_indices_only"
+        or qwen_config.get("attention_mask") != "model_native_decoder_causal"
+        or qwen_config.get("generation_strategy") != "greedy"
+        or qwen_config.get("do_sample") is not False
+        or qwen_config.get("dataset_prompt_mode") != "off"
+    ):
+        raise ValueError(f"unsafe Qwen cache configuration at {path}")
+    vjepa_config = configuration.get("vjepa", {})
+    if (
+        vjepa_config.get("input_scope") != "past_only_separate_forward"
+        or vjepa_config.get("target_scope") != "target_only_separate_forward"
+    ):
+        raise ValueError(f"unsafe V-JEPA cache configuration at {path}")
 
+    observed = payload.get("vjepa_input_feats")
+    target = payload.get("vjepa_target_feats")
+    if observed is None or target is None:
+        raise ValueError(
+            f"causal cache {path} must contain vjepa_input_feats and vjepa_target_feats"
+        )
+    observed = np.asarray(observed)
+    target = np.asarray(target)
+    if observed.ndim != 3 or target.ndim != 3:
+        raise ValueError(
+            f"causal V-JEPA tensors must be [T_latent,P,D] at {path}; "
+            f"got input={observed.shape}, target={target.shape}"
+        )
+    if observed.shape[1:] != target.shape[1:]:
+        raise ValueError(
+            f"input/target V-JEPA layouts differ at {path}: "
+            f"{observed.shape} vs {target.shape}"
+        )
 
-def collate_and_drop_inconsistent_samples(batch):
-    if not batch:
-        return None
-
-    # Use the first sample's key fields as the target shape
-    ref_img = batch[0][KEY_IMG_IDX]
-    ref_wld = batch[0][KEY_WORLD_IDX]
-    Ti_ref = _leading_dimension(ref_img)
-    Tw_ref = _leading_dimension(ref_wld)
-
-    good = []
-    drop = 0
-    for s in batch:
-        try:
-            img, wld = s[KEY_IMG_IDX], s[KEY_WORLD_IDX]
-            Ti, Tw = _leading_dimension(img), _leading_dimension(wld)
-            # Key fields: must exist, have T>0, and agree on T
-            if Ti is None or Tw is None or Ti <= 0 or Tw <= 0 or Ti != Tw:
-                drop += 1
-                continue
-
-            # Temporal fields: first dimension must equal this sample's T
-            T_ref = Ti
-            ok = True
-            for idx in TIME_FIELD_IDX:
-                x = s[idx]
-                if hasattr(x, "ndim") and x.ndim >= 1:
-                    t = x.shape[0]
-                    if t != T_ref:
-                        ok = False
-                        break
-            if not ok:
-                drop += 1
-                continue
-
-            # cam_int may be either (3, 3) or (T, 3, 3)
-            cam_int = s[7]
-            if not hasattr(cam_int, "ndim"):
-                drop += 1
-                continue
-            if not (
-                (cam_int.ndim == 2 and cam_int.shape == (3, 3))
-                or (
-                    cam_int.ndim == 3
-                    and cam_int.shape[0] == T_ref
-                    and cam_int.shape[-2:] == (3, 3)
-                )
-            ):
-                drop += 1
-                continue
-
-            good.append(s)
-        except Exception:
-            drop += 1
-
-    if drop:
-        print(f"[WARN] dropped {drop}/{len(batch)} (first-dim/shape mismatch)")
-    if not good:
-        return None
-    return default_collate(good)
+    observed_ids = np.asarray(payload.get("vjepa_input_frame_indices", []), dtype=np.int64).reshape(-1)
+    target_ids = np.asarray(payload.get("vjepa_target_frame_indices", []), dtype=np.int64).reshape(-1)
+    vlm_ids = np.asarray(payload.get("vlm_observation_frame_indices", []), dtype=np.int64).reshape(-1)
+    if observed_ids.size == 0 or target_ids.size == 0 or vlm_ids.size == 0:
+        raise ValueError(f"causal cache {path} is missing exact source frame indices")
+    if not set(observed_ids.tolist()).isdisjoint(set(target_ids.tolist())):
+        raise ValueError(f"observed and target raw frame sets overlap at {path}")
+    if not np.array_equal(vlm_ids, observed_ids):
+        raise ValueError(
+            f"VLM and V-JEPA observed frame indices differ at {path}; "
+            "the two branches must see the exact same observation window"
+        )
+    if observed_ids.shape != (32,) or target_ids.shape != (32,):
+        raise ValueError(
+            f"causal cache {path} must identify exactly 32 observed and 32 target frames; "
+            f"got {observed_ids.shape} and {target_ids.shape}"
+        )
+    total_frames = int(_cache_scalar(payload.get("source_total_frames"), -1))
+    split_raw_index = int(_cache_scalar(payload.get("split_raw_index"), -1))
+    if total_frames < 2 or split_raw_index != total_frames // 2:
+        raise ValueError(
+            f"invalid raw midpoint metadata at {path}: total={total_frames}, "
+            f"split={split_raw_index}"
+        )
+    expected_observed = np.linspace(
+        0, split_raw_index - 1, num=32, dtype=np.int64
+    )
+    expected_target = np.linspace(
+        split_raw_index, total_frames - 1, num=32, dtype=np.int64
+    )
+    if not np.array_equal(observed_ids, expected_observed):
+        raise ValueError(f"observed raw-frame sampling does not match supervision at {path}")
+    if not np.array_equal(target_ids, expected_target):
+        raise ValueError(f"target raw-frame sampling does not match supervision at {path}")
+    qwen_ids = np.asarray(payload.get("qwen_raw_indices", []), dtype=np.int64).reshape(-1)
+    if not np.array_equal(qwen_ids, observed_ids):
+        raise ValueError(f"Qwen raw-frame indices differ from V-JEPA input at {path}")
+    layers = np.asarray(payload.get("layers", []), dtype=np.int32).reshape(-1)
+    if layers.size == 0 or layers.tolist() != list(qwen_config.get("layers", [])):
+        raise ValueError(f"cached VLM layers differ from configuration at {path}")
+    vlm_old = np.asarray(payload.get("vlm_old", []))
+    vlm_new = np.asarray(payload.get("vlm_new", []))
+    if vlm_old.ndim != 3 or vlm_new.ndim != 3 or vlm_old.shape[0] != layers.size or vlm_new.shape[0] != layers.size:
+        raise ValueError(
+            f"invalid VLM guidance layout at {path}: old={vlm_old.shape} new={vlm_new.shape}"
+        )
+    input_valid_len = int(_cache_scalar(payload.get("input_valid_len"), -1))
+    if input_valid_len != int(vlm_old.shape[1]):
+        raise ValueError(
+            f"vlm_old length {vlm_old.shape[1]} does not match input_valid_len "
+            f"{input_valid_len} at {path}"
+        )
+    token_ids = np.asarray(payload.get("token_ids", [])).reshape(-1)
+    vlm_new_token_ids = np.asarray(payload.get("vlm_new_token_ids", [])).reshape(-1)
+    expected_new_states = max(int(token_ids.size) - 1, 0)
+    if int(vlm_new.shape[1]) != expected_new_states:
+        raise ValueError(
+            f"vlm_new/token_ids alignment mismatch at {path}: "
+            f"states={vlm_new.shape[1]} tokens={token_ids.size}"
+        )
+    if not np.array_equal(vlm_new_token_ids, token_ids[:expected_new_states]):
+        raise ValueError(f"vlm_new token alignment metadata mismatch at {path}")
 
 
 # ----------------------------- NPZ file utilities -----------------------------
@@ -380,7 +522,14 @@ def _build_cache_manifest_index(cache_dir: str) -> dict[tuple[str, str], str]:
         rel = os.path.relpath(npz_path, start=cache_dir)
         rel_dir = os.path.dirname(rel)
         stem = _normalize_thinker_cache_stem(npz_path)
-        index[(os.path.normpath(rel_dir), stem)] = npz_path
+        key = (os.path.normpath(rel_dir), stem)
+        previous = index.get(key)
+        if previous is not None and os.path.realpath(previous) != os.path.realpath(npz_path):
+            raise ValueError(
+                f"ambiguous cache archives for relative key {key}: "
+                f"{previous} and {npz_path}; remove legacy/duplicate caches"
+            )
+        index[key] = npz_path
     return index
 
 
@@ -393,6 +542,7 @@ def _rewrite_manifest_paths_to_cache_archives(
         raise ValueError("cache_dir is required when mapping manifests to npz cache")
 
     cache_dir = resolve_egodex_data_reference(str(cache_dir))
+    cache_root_real = os.path.realpath(cache_dir)
     cache_index = _build_cache_manifest_index(cache_dir)
     cache_leaf = os.path.basename(os.path.normpath(cache_dir))
     dataset_roots = _expand_dataset_root_candidates(dataset_path) if dataset_path is not None else []
@@ -402,17 +552,32 @@ def _rewrite_manifest_paths_to_cache_archives(
             return None
         if not os.path.isabs(path):
             candidate = os.path.join(cache_dir, os.path.normpath(path))
-            if os.path.exists(candidate):
-                return candidate
+            candidate_real = os.path.realpath(candidate)
+            if (
+                os.path.commonpath([cache_root_real, candidate_real]) == cache_root_real
+                and os.path.exists(candidate_real)
+            ):
+                return candidate_real
         if os.path.exists(path):
-            return path
+            path_real = os.path.realpath(path)
+            if os.path.isabs(path) and os.path.commonpath(
+                [cache_root_real, path_real]
+            ) != cache_root_real:
+                raise ValueError(
+                    f"manifest cache path escapes configured cache_root: {path}"
+                )
+            return path_real
         parts = list(Path(os.path.normpath(path)).parts)
         for idx, part in enumerate(parts):
             if part != cache_leaf:
                 continue
             candidate = os.path.join(cache_dir, *parts[idx + 1 :])
-            if os.path.exists(candidate):
-                return candidate
+            candidate_real = os.path.realpath(candidate)
+            if (
+                os.path.commonpath([cache_root_real, candidate_real]) == cache_root_real
+                and os.path.exists(candidate_real)
+            ):
+                return candidate_real
         return None
 
     out: list[str] = []
@@ -452,7 +617,7 @@ def _load_path_manifest_file(manifest_path: str, dataset_path: str | None = None
     if len(paths) == 0:
         raise ValueError(f"manifest has no usable paths: {manifest_path}")
     if dataset_path is not None:
-        paths = rewrite_manifest_paths_for_release(paths, dataset_path)
+        paths = rewrite_manifest_paths(paths, dataset_path)
     return paths
 
 
@@ -609,6 +774,7 @@ def load_supervision_from_hdf5(hdf5_file: str, query_tfs) -> dict:
         confs = np.ones((xyz_cam.shape[0], xyz_cam.shape[1]), dtype=np.float32)
 
     return {
+        "source_total_frames": T,
         "frame_indices": frame_indices,
         "xyz_cam": xyz_cam,
         "R_cam": R_cam,
@@ -690,10 +856,11 @@ def build_egodex_dataloaders(
     persistent_workers: bool = False,
     prefetch_factor: int | None = None,
     preload_to_memory: bool = False,
+    load_cache_images: bool = True,
     camera_mode: str = "auto",
     # NPZ padding configuration
-    pad_old_to: int = 480,
-    pad_new_to: int = 15,
+    pad_old_to: int = 1280,
+    pad_new_to: int = 16,
     pad_value: float = 0.0,
     supervision_cache_root: str | None = None,
 ):
@@ -703,8 +870,12 @@ def build_egodex_dataloaders(
       (list_cache_npz_files + split_cache_npz_files_abt + NpzCacheDataset(files))
     """
 
-    if bool(train_manifest) ^ bool(test_manifest):
-        raise ValueError("train_manifest and test_manifest must be provided together")
+    if not use_npz_cache:
+        raise ValueError("ThinkJEPA training requires the validated schema-v2 NPZ cache")
+    if not train_manifest or not test_manifest:
+        raise ValueError(
+            "ThinkJEPA training requires both group-aware train/validation manifests"
+        )
 
     dl_kwargs = {
         "num_workers": num_workers,
@@ -722,6 +893,11 @@ def build_egodex_dataloaders(
         dataset_roots = _expand_roots_for_sidecar_lookup(dataset_path)
 
         if use_npz_cache:
+            if len(dataset_roots) != 1:
+                raise ValueError(
+                    "schema-v2 cache loading requires exactly one explicit supervision root"
+                )
+            supervision_root = dataset_roots[0] if len(dataset_roots) == 1 else None
             train_files = _rewrite_manifest_paths_to_cache_archives(
                 train_files, dataset_path=dataset_path, cache_dir=cache_dir
             )
@@ -737,7 +913,9 @@ def build_egodex_dataloaders(
                 pad_new_to=pad_new_to,
                 pad_value=pad_value,
                 data_roots=dataset_roots,
+                supervision_root=supervision_root,
                 cache_root=cache_dir,
+                load_images=load_cache_images,
             )
             test_ds = NpzCacheDataset(
                 test_files,
@@ -748,7 +926,9 @@ def build_egodex_dataloaders(
                 pad_new_to=pad_new_to,
                 pad_value=pad_value,
                 data_roots=dataset_roots,
+                supervision_root=supervision_root,
                 cache_root=cache_dir,
+                load_images=load_cache_images,
             )
         else:
             train_ds = SimpleDataset(
@@ -802,6 +982,11 @@ def build_egodex_dataloaders(
         train_files, test_files = split_cache_npz_files_abt(files_all, a, b)
 
         dataset_roots = _expand_roots_for_sidecar_lookup(dataset_path)
+        if len(dataset_roots) != 1:
+            raise ValueError(
+                "schema-v2 cache loading requires exactly one explicit supervision root"
+            )
+        supervision_root = dataset_roots[0] if len(dataset_roots) == 1 else None
         train_ds = NpzCacheDataset(
             train_files,
             if_return_path=if_return_path,
@@ -811,7 +996,9 @@ def build_egodex_dataloaders(
             pad_new_to=pad_new_to,
             pad_value=pad_value,
             data_roots=dataset_roots,
+            supervision_root=supervision_root,
             cache_root=cache_dir,
+            load_images=load_cache_images,
         )
         test_ds = NpzCacheDataset(
             test_files,
@@ -822,7 +1009,9 @@ def build_egodex_dataloaders(
             pad_new_to=pad_new_to,
             pad_value=pad_value,
             data_roots=dataset_roots,
+            supervision_root=supervision_root,
             cache_root=cache_dir,
+            load_images=load_cache_images,
         )
         train_loader = DataLoader(
             train_ds,
@@ -914,11 +1103,19 @@ def build_egodex_dataloaders(
 
 
 def _sample_dense_jepa_frame_indices(T: int) -> np.ndarray:
-    if T <= 0:
-        raise ValueError("Empty episode (T=0).")
-    # No wrap-around: generate 64 non-decreasing points in [0, T-1];
-    # later _h5_take_sorted_unique handles h5py's strict monotonicity requirement
-    return np.linspace(0, T - 1, num=64, dtype=np.int64)
+    if T < 2:
+        raise ValueError(
+            f"A causal past/future cache needs at least two source frames, got T={T}."
+        )
+    # Split the raw timeline first, then sample each half independently.  If we
+    # sampled 64 points globally and split the resulting list, short clips can
+    # repeat the same raw frame on both sides of the boundary.
+    midpoint = T // 2
+    past = np.linspace(0, midpoint - 1, num=32, dtype=np.int64)
+    future = np.linspace(midpoint, T - 1, num=32, dtype=np.int64)
+    if np.intersect1d(past, future).size:
+        raise AssertionError("past/future raw frame indices must be disjoint")
+    return np.concatenate([past, future], axis=0)
 
 
 class SimpleDataset(torch.utils.data.Dataset):
@@ -1063,8 +1260,8 @@ class NpzCacheDataset(torch.utils.data.Dataset):
     to float32.
     - Directory scanning/splitting is not handled here; it happens externally
       (list_cache_npz_files + split_cache_npz_files_abt)
-    - Optionally pad/truncate to fixed lengths pad_old_to / pad_new_to and return
-      the corresponding mask and original length
+    - Losslessly pad to fixed capacities pad_old_to / pad_new_to and return the
+      corresponding mask and original length; overflow is rejected, never truncated
     """
 
     def __init__(
@@ -1072,13 +1269,15 @@ class NpzCacheDataset(torch.utils.data.Dataset):
         files: list[str],
         if_return_path: bool = True,
         preload_to_memory: bool = False,
-        pad_old_to: int = 480,
-        pad_new_to: int = 15,
+        pad_old_to: int = 1280,
+        pad_new_to: int = 16,
         pad_value: float = 0.0,
         camera_mode: str = "auto",
         data_roots: list[str] | None = None,
+        supervision_root: str | None = None,
         cache_root: str | None = None,
         npz_save_mode: str = "raw",
+        load_images: bool = True,
     ):
         if not isinstance(files, (list, tuple)) or len(files) == 0:
             raise ValueError("`files` must be a non-empty list of .npz paths")
@@ -1091,12 +1290,23 @@ class NpzCacheDataset(torch.utils.data.Dataset):
         self.pad_value = float(pad_value)
         self.camera_mode = str(camera_mode).strip().lower()
         self.data_roots = [os.path.abspath(x) for x in (data_roots or [])]
+        self.supervision_root = (
+            os.path.realpath(os.path.abspath(supervision_root))
+            if supervision_root
+            else None
+        )
         self.cache_root = os.path.abspath(cache_root) if cache_root else None
         self.npz_save_mode = str(npz_save_mode).strip().lower()
+        self.load_images = bool(load_images)
+        if self.supervision_root is None:
+            raise ValueError(
+                "schema-v2 feature caches require one explicit supervision_root"
+            )
         if self.camera_mode not in {"auto", "egodex", "egoexo"}:
             raise ValueError(
                 f"`camera_mode` must be one of auto|egodex|egoexo, got {camera_mode}"
             )
+        self.cache_config_fingerprint = self._validate_archive_set_identity()
         self._memory_samples = None
         if self.preload_to_memory:
             print(
@@ -1107,6 +1317,32 @@ class NpzCacheDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.files)
+
+    def _validate_archive_set_identity(self) -> str | None:
+        """Reject cache-root escapes and mixed extractor/model configurations."""
+        fingerprints: set[str] = set()
+        cache_root_real = os.path.realpath(self.cache_root) if self.cache_root else None
+        for path in self.files:
+            path_real = os.path.realpath(path)
+            if cache_root_real is not None and os.path.commonpath(
+                [cache_root_real, path_real]
+            ) != cache_root_real:
+                raise ValueError(
+                    f"cache archive escapes configured cache_root: {path}"
+                )
+            with np.load(path_real, allow_pickle=False) as archive:
+                fingerprint = str(
+                    _cache_scalar(archive.get("cache_config_fingerprint"), "")
+                )
+            if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+                raise ValueError(f"cache archive has no valid configuration identity: {path}")
+            fingerprints.add(fingerprint)
+            if len(fingerprints) > 1:
+                raise ValueError(
+                    "cache set mixes multiple extractor/model configurations: "
+                    f"{sorted(fingerprints)}"
+                )
+        return next(iter(fingerprints), None)
 
     def _cast_tensor_to_float32_cpu(self, x):
         return torch.from_numpy(x).float().contiguous() if x is not None else None
@@ -1465,38 +1701,42 @@ class NpzCacheDataset(torch.utils.data.Dataset):
         npz_path: str,
         hdf5_path_hint: str | None,
         video_path_hint: str | None,
+        source_video_relpath: str | None = None,
     ) -> str | None:
-        # Cross-cluster runs may carry stale absolute paths inside NPZ metadata.
-        # Prefer the explicit dataset/cache roots provided at runtime.
-        if self.cache_root is not None and len(self.data_roots) > 0:
-            try:
-                rel = os.path.relpath(npz_path, start=self.cache_root)
-            except ValueError:
-                rel = None
-            if rel is not None:
-                rel_dir = os.path.dirname(rel)
-                stem = _normalize_thinker_cache_stem(npz_path)
-                for root in self.data_roots:
-                    candidate = os.path.join(root, rel_dir, stem + ".hdf5")
-                    if os.path.exists(candidate):
-                        return os.path.abspath(candidate)
-        if hdf5_path_hint and hdf5_path_hint.endswith(".hdf5") and os.path.exists(hdf5_path_hint):
-            return os.path.abspath(hdf5_path_hint)
-        if video_path_hint:
-            hdf5_path = _resolve_hdf5_path_from_video(video_path_hint)
-            if hdf5_path is not None:
-                return os.path.abspath(hdf5_path)
-        return None
-
-    @staticmethod
-    def _read_cache_payload_copy(npz_path: str) -> dict[str, Any]:
-        with np.load(npz_path, allow_pickle=False) as payload:
-            return {key: np.array(payload[key], copy=True) for key in payload.files}
-
-    def _persist_cache_payload_patch(self, npz_path: str, patch: dict[str, Any]) -> None:
-        payload = self._read_cache_payload_copy(npz_path)
-        payload.update(patch)
-        _save_npz_atomic_archive(npz_path, payload, save_mode=self.npz_save_mode)
+        del hdf5_path_hint, video_path_hint
+        if not source_video_relpath or self.supervision_root is None:
+            _raise_camera_geometry_error(
+                npz_path,
+                "egodex_cache_join",
+                "schema-v2 join requires source_video_relpath and explicit supervision_root",
+            )
+        source_text = str(source_video_relpath)
+        rel = Path(source_text)
+        if (
+            not source_text
+            or "\x00" in source_text
+            or "\\" in source_text
+            or rel.is_absolute()
+            or ".." in rel.parts
+            or rel.as_posix() != source_text
+            or rel.suffix.lower() != ".mp4"
+        ):
+            _raise_camera_geometry_error(
+                npz_path,
+                "egodex_cache_join",
+                f"unsafe source_video_relpath={source_video_relpath!r}",
+            )
+        root_real = self.supervision_root
+        candidate = os.path.realpath(
+            os.path.join(root_real, str(rel.with_suffix(".hdf5")))
+        )
+        if os.path.commonpath([root_real, candidate]) != root_real:
+            _raise_camera_geometry_error(
+                npz_path,
+                "egodex_cache_join",
+                f"source_video_relpath escapes supervision_root: {source_video_relpath!r}",
+            )
+        return candidate if os.path.isfile(candidate) else None
 
     def _repair_from_egodex_supervision(
         self,
@@ -1504,9 +1744,15 @@ class NpzCacheDataset(torch.utils.data.Dataset):
         *,
         hdf5_path_hint: str | None,
         video_path_hint: str | None,
+        source_video_relpath: str | None,
+        expected_total_frames: int | None,
+        expected_frame_indices: np.ndarray | None,
     ) -> dict[str, Any]:
         hdf5_path = self._resolve_hdf5_path_from_cache_archive(
-            npz_path, hdf5_path_hint=hdf5_path_hint, video_path_hint=video_path_hint
+            npz_path,
+            hdf5_path_hint=hdf5_path_hint,
+            video_path_hint=video_path_hint,
+            source_video_relpath=source_video_relpath,
         )
         if hdf5_path is None:
             _raise_camera_geometry_error(
@@ -1515,6 +1761,24 @@ class NpzCacheDataset(torch.utils.data.Dataset):
                 "could not resolve source hdf5 for cache repair",
             )
         sup = load_supervision_from_hdf5(hdf5_path, NPZ_TARGET_QUERY_TFS)
+        if expected_total_frames is not None and int(sup["source_total_frames"]) != int(
+            expected_total_frames
+        ):
+            _raise_camera_geometry_error(
+                npz_path,
+                "egodex_cache_join",
+                f"source frame count mismatch: cache={expected_total_frames} "
+                f"hdf5={sup['source_total_frames']}",
+            )
+        if expected_frame_indices is not None and not np.array_equal(
+            np.asarray(sup["frame_indices"], dtype=np.int64),
+            np.asarray(expected_frame_indices, dtype=np.int64),
+        ):
+            _raise_camera_geometry_error(
+                npz_path,
+                "egodex_cache_join",
+                "HDF5 supervision frame indices differ from causal cache indices",
+            )
         patch = {
             "frame_indices": np.asarray(sup["frame_indices"], dtype=np.int64),
             "xyz_cam": np.asarray(sup["xyz_cam"], dtype=np.float32),
@@ -1529,7 +1793,9 @@ class NpzCacheDataset(torch.utils.data.Dataset):
             "lang_instruct": np.asarray(str(sup.get("lang_instruct", ""))),
             "path": np.asarray(str(hdf5_path)),
         }
-        self._persist_cache_payload_patch(npz_path, patch)
+        # Keep schema-v2 feature archives immutable.  Supervision is joined
+        # from its independent HDF5 source in memory and is never written back
+        # into the causal cache (which would reintroduce stale/legacy keys).
         patch["lang_instruct"] = sup.get("lang_instruct", "")
         return patch
 
@@ -1647,7 +1913,8 @@ class NpzCacheDataset(torch.utils.data.Dataset):
             "cam_int": np.asarray(ego_cam_int, dtype=np.float32),
             "confs": confs,
         }
-        self._persist_cache_payload_patch(npz_path, patch)
+        # Derived supervision remains an in-memory view; do not mutate the
+        # validated causal feature archive during dataset loading.
         patch["lang_instruct"] = _coerce_language_annotation(lang_np) if lang_np is not None else ""
         return patch
 
@@ -1670,12 +1937,12 @@ class NpzCacheDataset(torch.utils.data.Dataset):
         if S == tgt:
             mask = torch.ones_like(x, dtype=torch.bool)
             return x.contiguous(), mask, S
-        if S > tgt:  # Truncate
-            slices = [slice(None)] * x.dim()
-            slices[dim] = slice(0, tgt)
-            y = x[tuple(slices)].contiguous()
-            mask = torch.ones_like(y, dtype=torch.bool)
-            return y, mask, S
+        if S > tgt:
+            raise ValueError(
+                f"VLM guidance length {S} exceeds configured capacity {tgt}; "
+                "increase pad_old_to/pad_new_to instead of silently truncating "
+                "observed-video or prompt tokens"
+            )
         # padding
         pad_shape = list(x.shape)
         pad_shape[dim] = tgt
@@ -1690,15 +1957,76 @@ class NpzCacheDataset(torch.utils.data.Dataset):
     def _load_cache_sample(self, path: str):
         try:
             with np.load(path, allow_pickle=False) as z:
-                # Required fields (matching the saved layout)
-                imgs_np = z["imgs"]  # [T,H,W,C] uint8
+                forbidden = sorted(
+                    (set(z.files) & CAUSAL_FEATURE_FORBIDDEN_KEYS)
+                    | {key for key in z.files if key.startswith("egoexo_")}
+                )
+                if forbidden:
+                    raise ValueError(
+                        f"causal feature cache {path} contains supervision/legacy keys: "
+                        f"{forbidden}"
+                    )
+                # Images are only needed for online encoders or qualitative rendering.
+                # Validated offline feature training can use a zero-sized placeholder
+                # whose temporal length is recovered from the causal frame indices.
+                imgs_np = z["imgs"] if self.load_images else None
 
                 # ---- Read saved VLM / V-JEPA fields (or None if absent) ----
                 vlm_old_np = z.get("vlm_old", None)  # expected [L, S_old, D] or [L, T, S, D]
                 vlm_new_np = z.get("vlm_new", None)  # expected [L, S_new, D] or [L, T, S, D]
                 token_ids_np = z.get("token_ids", None)  # int32
+                vlm_new_token_ids_np = z.get("vlm_new_token_ids", None)  # int32
                 layers_np = z.get("layers", None)  # int32
-                vjepa_np = z.get("vjepa_feats", None)  # [T,P,D]
+                vjepa_input_np = z.get("vjepa_input_feats", None)  # [T_latent,P,D]
+                vjepa_target_np = z.get("vjepa_target_feats", None)  # [T_latent,P,D]
+                causal_meta_np = {
+                    key: z.get(key, None)
+                    for key in (
+                        "cache_schema_version",
+                        "cache_schema_name",
+                        "vlm_observation_policy",
+                        "extractor_version",
+                        "sampling_strategy",
+                        "configuration_json",
+                        "configuration_fingerprint",
+                        "source_video_relpath",
+                        "source_total_frames",
+                        "split_raw_index",
+                        "qwen_raw_indices",
+                        "vjepa_input_frame_indices",
+                        "vjepa_target_frame_indices",
+                        "vlm_observation_frame_indices",
+                        "vjepa_tubelet_size",
+                        "cache_config_fingerprint",
+                        "input_valid_len",
+                    )
+                }
+                # Reuse the arrays already read above.  NpzFile.get() inflates a
+                # compressed member on every access; reading these large VLM arrays
+                # again for validation roughly doubled per-sample decompression.
+                causal_meta_np.update(
+                    {
+                        "layers": layers_np,
+                        "vlm_old": vlm_old_np,
+                        "vlm_new": vlm_new_np,
+                        "token_ids": token_ids_np,
+                        "vlm_new_token_ids": vlm_new_token_ids_np,
+                    }
+                )
+                causal_payload = {
+                    **causal_meta_np,
+                    "vjepa_input_feats": vjepa_input_np,
+                    "vjepa_target_feats": vjepa_target_np,
+                }
+                has_causal_vjepa = vjepa_input_np is not None or vjepa_target_np is not None
+                has_vlm_guidance = vlm_old_np is not None or vlm_new_np is not None
+                if has_causal_vjepa:
+                    validate_causal_cache_payload(causal_payload, path=path)
+                elif has_vlm_guidance:
+                    raise ValueError(
+                        f"VLM cache {path} has no combined causal V-JEPA provenance; "
+                        "rebuild it with cache_train/rebuild_causal_cache.py"
+                    )
 
                 # Supervision / geometry
                 xyz_cam_np = z.get("xyz_cam", None)
@@ -1740,7 +2068,37 @@ class NpzCacheDataset(torch.utils.data.Dataset):
             # but for now we keep the original behavior and re-raise.
             raise
 
-        img_t = int(imgs_np.shape[0]) if hasattr(imgs_np, "shape") and len(imgs_np.shape) >= 1 else 0
+        source_video_relpath = str(
+            _cache_scalar(causal_meta_np.get("source_video_relpath"), "")
+        ) or None
+        expected_total_frames = self._to_int_scalar(
+            causal_meta_np.get("source_total_frames")
+        )
+        expected_frame_indices = None
+        if has_causal_vjepa:
+            expected_frame_indices = np.concatenate(
+                [
+                    np.asarray(
+                        causal_meta_np["vjepa_input_frame_indices"], dtype=np.int64
+                    ).reshape(-1),
+                    np.asarray(
+                        causal_meta_np["vjepa_target_frame_indices"], dtype=np.int64
+                    ).reshape(-1),
+                ]
+            )
+        if imgs_np is not None:
+            img_t = (
+                int(imgs_np.shape[0])
+                if hasattr(imgs_np, "shape") and len(imgs_np.shape) >= 1
+                else 0
+            )
+        elif expected_frame_indices is not None and expected_frame_indices.size > 0:
+            img_t = int(expected_frame_indices.size)
+            imgs_np = np.empty((img_t, 0, 0, 3), dtype=np.uint8)
+        else:
+            raise ValueError(
+                f"cannot skip cached images without causal frame indices: {path}"
+            )
         total_frames = self._to_int_scalar(total_frames_np)
         hdf5_path_hint = _scalar_to_string(hdf5_path_hint_np)
         video_path_hint = _scalar_to_string(video_path_hint_np)
@@ -1821,6 +2179,9 @@ class NpzCacheDataset(torch.utils.data.Dataset):
                     path,
                     hdf5_path_hint=hdf5_path_hint,
                     video_path_hint=video_path_hint,
+                    source_video_relpath=source_video_relpath,
+                    expected_total_frames=expected_total_frames,
+                    expected_frame_indices=expected_frame_indices,
                 )
             xyz_cam_np = repaired.get("xyz_cam", xyz_cam_np)
             R_cam_np = repaired.get("R_cam", R_cam_np)
@@ -1865,6 +2226,9 @@ class NpzCacheDataset(torch.utils.data.Dataset):
                 path,
                 hdf5_path_hint=hdf5_path_hint,
                 video_path_hint=video_path_hint,
+                source_video_relpath=source_video_relpath,
+                expected_total_frames=expected_total_frames,
+                expected_frame_indices=expected_frame_indices,
             )
             xyz_cam_np = repaired.get("xyz_cam", xyz_cam_np)
             R_cam_np = repaired.get("R_cam", R_cam_np)
@@ -1989,13 +2353,28 @@ class NpzCacheDataset(torch.utils.data.Dataset):
             if vlm_new_np is not None
             else None
         )
-        vjepa_feats = (
-            torch.from_numpy(vjepa_np).contiguous() if vjepa_np is not None else None
+        vjepa_input_feats = (
+            torch.from_numpy(_maybe_decode_bfloat16_cache_array(vjepa_input_np)).float().contiguous()
+            if vjepa_input_np is not None
+            else None
+        )
+        vjepa_target_feats = (
+            torch.from_numpy(_maybe_decode_bfloat16_cache_array(vjepa_target_np)).float().contiguous()
+            if vjepa_target_np is not None
+            else None
         )
 
         token_ids = (
             torch.from_numpy(token_ids_np).to(torch.int32).contiguous()
             if token_ids_np is not None
+            else None
+        )
+        vlm_new_token_ids = (
+            torch.from_numpy(np.asarray(vlm_new_token_ids_np))
+            .to(torch.int32)
+            .reshape(-1)
+            .contiguous()
+            if vlm_new_token_ids_np is not None
             else None
         )
         layers = (
@@ -2032,6 +2411,25 @@ class NpzCacheDataset(torch.utils.data.Dataset):
         if vlm_new_mask is not None and vlm_new_mask.dim() == 3:
             vlm_new_mask = vlm_new_mask.any(dim=-1)  # [L,S]
 
+        def pad_token_ids_losslessly(ids: torch.Tensor | None) -> tuple[torch.Tensor | None, int]:
+            if ids is None:
+                return None, 0
+            ids = ids.reshape(-1).to(torch.int32).contiguous()
+            length = int(ids.numel())
+            if length > self.pad_new_to:
+                raise ValueError(
+                    f"token-id length {length} exceeds configured capacity "
+                    f"{self.pad_new_to}; refusing silent truncation for {path}"
+                )
+            out = ids.new_full((self.pad_new_to,), -1)
+            out[:length] = ids
+            return out, length
+
+        token_ids, token_ids_len = pad_token_ids_losslessly(token_ids)
+        vlm_new_token_ids, vlm_new_token_ids_len = pad_token_ids_losslessly(
+            vlm_new_token_ids
+        )
+
         extras = {
             "vlm_old": vlm_old_pad if vlm_old_pad is not None else vlm_old,  # [L,S,D]
             "vlm_new": vlm_new_pad if vlm_new_pad is not None else vlm_new,  # [L,S,D]
@@ -2040,9 +2438,43 @@ class NpzCacheDataset(torch.utils.data.Dataset):
             "vlm_old_len": vlm_old_len,  # Original length
             "vlm_new_len": vlm_new_len,  # Original length
             "token_ids": token_ids,  # int32
+            "token_ids_len": token_ids_len,
+            "vlm_new_token_ids": vlm_new_token_ids,
+            "vlm_new_token_ids_len": vlm_new_token_ids_len,
             "layers": layers,  # int32
-            "vjepa_feats": vjepa_feats,  # [T,P,D]
+            "vjepa_input_feats": vjepa_input_feats,  # safe [T_latent,P,D]
+            "vjepa_target_feats": vjepa_target_feats,  # safe [T_latent,P,D]
+            "cache_schema_version": self._to_int_scalar(
+                causal_meta_np.get("cache_schema_version")
+            ),
+            "cache_schema_name": str(
+                _cache_scalar(causal_meta_np.get("cache_schema_name"), "")
+            ),
+            "vlm_observation_policy": str(
+                _cache_scalar(causal_meta_np.get("vlm_observation_policy"), "")
+            ),
+            "vjepa_input_frame_indices": torch.from_numpy(
+                np.asarray(causal_meta_np.get("vjepa_input_frame_indices"), dtype=np.int64)
+            ).contiguous()
+            if causal_meta_np.get("vjepa_input_frame_indices") is not None
+            else None,
+            "vjepa_target_frame_indices": torch.from_numpy(
+                np.asarray(causal_meta_np.get("vjepa_target_frame_indices"), dtype=np.int64)
+            ).contiguous()
+            if causal_meta_np.get("vjepa_target_frame_indices") is not None
+            else None,
+            "vlm_observation_frame_indices": torch.from_numpy(
+                np.asarray(causal_meta_np.get("vlm_observation_frame_indices"), dtype=np.int64)
+            ).contiguous()
+            if causal_meta_np.get("vlm_observation_frame_indices") is not None
+            else None,
+            "vjepa_tubelet_size": self._to_int_scalar(
+                causal_meta_np.get("vjepa_tubelet_size")
+            ),
         }
+        # ``default_collate`` cannot collate ``None`` values nested in dicts.
+        # Missing optional fields are represented by an absent key instead.
+        extras = {key: value for key, value in extras.items() if value is not None}
 
         tup = (
             xyz_cam,

@@ -16,7 +16,7 @@ VJEPA2_ROOT = Path(
 )
 
 
-def _resolve_release_path(label: str, env_var: str, candidates: list[Path]) -> str:
+def _resolve_checkpoint_path(label: str, env_var: str, candidates: list[Path]) -> str:
     env_value = os.environ.get(env_var)
     if env_value:
         return env_value
@@ -33,7 +33,7 @@ def _resolve_release_path(label: str, env_var: str, candidates: list[Path]) -> s
 
 
 def resolve_dense_jepa_checkpoint() -> str:
-    return _resolve_release_path(
+    return _resolve_checkpoint_path(
         label="the ThinkJEPA JEPA-branch ViT-L checkpoint",
         env_var="THINKJEPA_JEPA_VITL_PT",
         candidates=[

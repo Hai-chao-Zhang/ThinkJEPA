@@ -8,7 +8,6 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def _run_attention_in_module_dtype(attn_module, query, key, value):

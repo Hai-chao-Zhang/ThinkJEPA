@@ -1,4 +1,4 @@
-# Core train/eval dependencies for the released ThinkJEPA path.
+# Core ThinkJEPA train/eval dependencies.
 # Install torch / torchvision / torchaudio separately so they match your CUDA runtime.
 
 numpy>=2.2

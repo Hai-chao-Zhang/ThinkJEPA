@@ -6,4 +6,4 @@
 # Original source: https://github.com/Hai-chao-Zhang/ThinkJEPA
 # See the root LICENSE, NOTICE, CITATION.cff, and CITATION.bib for attribution and citation requirements.
 
-"""Publication-facing training and cache namespace for the ThinkJEPA release."""
+"""ThinkJEPA training and cache utilities."""

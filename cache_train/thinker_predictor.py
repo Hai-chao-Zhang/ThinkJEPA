@@ -31,7 +31,11 @@ class LayerwiseGuidanceBank:
             return self
         if self.mode == "crossattn":
             repeated_layers = [
-                layer_tokens.repeat(repeat_factor, 1, 1) for layer_tokens in self.layers
+                (
+                    layer_tokens.repeat(repeat_factor, 1, 1),
+                    key_padding_mask.repeat(repeat_factor, 1),
+                )
+                for layer_tokens, key_padding_mask in self.layers
             ]
         else:
             repeated_layers = [
@@ -93,6 +97,7 @@ class CortexGuidedVideoPredictor(nn.Module):
         vlm_old_dim=3584,
         vlm_new_dim=3584,
         vlm_hidden=512,
+        causal_attention=True,
         **kwargs,
     ):
         super().__init__()
@@ -113,6 +118,7 @@ class CortexGuidedVideoPredictor(nn.Module):
         self.use_activation_checkpointing = use_activation_checkpointing
         self.position_uniform_power = uniform_power
         self.use_rope = use_rope
+        self.causal_attention = bool(causal_attention)
 
         self.context_adapter = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
 
@@ -308,40 +314,119 @@ class CortexGuidedVideoPredictor(nn.Module):
         denom = weight.sum(dim=dim).clamp_min(eps)
         return numer / denom
 
-    def _project_guidance_layer(self, guidance_stream, layer_index, projector):
-        if guidance_stream is None or layer_index >= guidance_stream.size(0):
+    @staticmethod
+    def _normalize_guidance_stream(guidance_stream, batch_size, name):
+        if guidance_stream is None:
             return None
-        return projector(guidance_stream[layer_index])
+        if guidance_stream.dim() == 3:  # legacy/single sample [L,S,D]
+            if batch_size != 1:
+                raise ValueError(
+                    f"{name} is missing its batch axis for JEPA batch={batch_size}; "
+                    "refusing to broadcast one sample's VLM state across the batch"
+                )
+            guidance_stream = guidance_stream.unsqueeze(0)
+        if guidance_stream.dim() != 4:
+            raise ValueError(
+                f"{name} must be [L,S,D] or [B,L,S,D], got {tuple(guidance_stream.shape)}"
+            )
+        if guidance_stream.size(0) != batch_size:
+            raise ValueError(
+                f"{name} batch={guidance_stream.size(0)} does not match JEPA batch={batch_size}"
+            )
+        return guidance_stream
 
     @staticmethod
-    def _select_valid_guidance_tokens(token_set, token_mask):
-        if token_set is None:
+    def _normalize_guidance_mask_bank(mask_bank, batch_size, name):
+        if mask_bank is None:
             return None
-        if token_mask is None:
-            return token_set
-        valid_mask = token_mask.to(dtype=torch.bool)
-        return token_set[valid_mask]
+        if mask_bank.dim() == 2:  # [L,S]
+            if batch_size != 1:
+                raise ValueError(
+                    f"{name} is missing its batch axis for JEPA batch={batch_size}"
+                )
+            mask_bank = mask_bank.unsqueeze(0)
+        if mask_bank.dim() != 3:
+            raise ValueError(
+                f"{name} must be [L,S] or [B,L,S], got {tuple(mask_bank.shape)}"
+            )
+        if mask_bank.size(0) != batch_size:
+            raise ValueError(
+                f"{name} batch={mask_bank.size(0)} does not match JEPA batch={batch_size}"
+            )
+        return mask_bank.to(dtype=torch.bool)
 
-    def _build_cross_attention_memory(self, old_tokens, new_tokens, old_mask, new_mask, device):
+    @staticmethod
+    def _mapped_level_index(predictor_layer, predictor_layer_count, level_count):
+        if level_count <= 1 or predictor_layer_count <= 1:
+            return 0
+        return int(
+            round(float(predictor_layer) * float(level_count - 1) / float(predictor_layer_count - 1))
+        )
+
+    def _project_guidance_layer(
+        self, guidance_stream, layer_index, layer_count, projector
+    ):
+        if guidance_stream is None:
+            return None
+        source_index = self._mapped_level_index(
+            layer_index, layer_count, guidance_stream.size(1)
+        )
+        return projector(guidance_stream[:, source_index, ...])
+
+    def _select_guidance_mask_layer(self, mask_bank, layer_index, layer_count):
+        if mask_bank is None:
+            return None
+        source_index = self._mapped_level_index(
+            layer_index, layer_count, mask_bank.size(1)
+        )
+        return mask_bank[:, source_index, ...].to(dtype=torch.bool)
+
+    def _build_cross_attention_memory(
+        self, old_tokens, new_tokens, old_mask, new_mask, batch_size, device
+    ):
         memory_parts = []
-        valid_old = self._select_valid_guidance_tokens(old_tokens, old_mask)
-        valid_new = self._select_valid_guidance_tokens(new_tokens, new_mask)
-        if valid_old is not None and valid_old.numel() > 0:
-            memory_parts.append(valid_old)
-        if valid_new is not None and valid_new.numel() > 0:
-            memory_parts.append(valid_new)
-        if len(memory_parts) == 0:
+        valid_parts = []
+        for tokens, valid in ((old_tokens, old_mask), (new_tokens, new_mask)):
+            if tokens is None:
+                continue
+            if valid is None:
+                valid = torch.ones(
+                    tokens.shape[:2], dtype=torch.bool, device=tokens.device
+                )
+            memory_parts.append(tokens)
+            valid_parts.append(valid.to(dtype=torch.bool, device=tokens.device))
+        if not memory_parts:
             hidden_width = self.context_adapter.out_features
-            return torch.zeros(1, hidden_width, device=device)
-        return torch.cat(memory_parts, dim=0)
+            memory = torch.zeros(batch_size, 1, hidden_width, device=device)
+            valid = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+        else:
+            memory = torch.cat(memory_parts, dim=1)
+            valid = torch.cat(valid_parts, dim=1)
+            # MultiheadAttention cannot consume a row whose complete memory is padded.
+            empty_rows = ~valid.any(dim=1)
+            if empty_rows.any():
+                valid = valid.clone()
+                memory = memory.clone()
+                valid[empty_rows, 0] = True
+                memory[empty_rows, 0, :] = 0
+        return memory, ~valid
 
-    def _build_residual_style_guidance(self, old_tokens, new_tokens, old_mask, new_mask, layer_index, batch_size, device):
-        old_summary = self._reduce_token_set(old_tokens, old_mask, dim=0)
-        new_summary = self._reduce_token_set(new_tokens, new_mask, dim=0)
+    def _build_residual_style_guidance(
+        self,
+        old_tokens,
+        new_tokens,
+        old_mask,
+        new_mask,
+        layer_index,
+        batch_size,
+        device,
+    ):
+        old_summary = self._reduce_token_set(old_tokens, old_mask, dim=1)
+        new_summary = self._reduce_token_set(new_tokens, new_mask, dim=1)
         if old_summary is None and new_summary is None:
             hidden_width = self.context_adapter.out_features
-            old_summary = torch.zeros(hidden_width, device=device)
-            new_summary = torch.zeros(hidden_width, device=device)
+            old_summary = torch.zeros(batch_size, hidden_width, device=device)
+            new_summary = torch.zeros(batch_size, hidden_width, device=device)
         elif old_summary is None:
             old_summary = torch.zeros_like(new_summary)
         elif new_summary is None:
@@ -358,13 +443,8 @@ class CortexGuidedVideoPredictor(nn.Module):
         )
         scale_shift = self.guidance_fusion_mlps[layer_index](fusion_signature)
         scale_tokens, shift_tokens = scale_shift.chunk(2, dim=-1)
-        residual_gate = torch.tanh(self.guidance_layer_scale[layer_index]).reshape(1)
-        scale_tokens = (scale_tokens * residual_gate).view(-1)
-        shift_tokens = (shift_tokens * residual_gate).view(-1)
-        return (
-            scale_tokens.unsqueeze(0).expand(batch_size, -1),
-            shift_tokens.unsqueeze(0).expand(batch_size, -1),
-        )
+        residual_gate = torch.tanh(self.guidance_layer_scale[layer_index]).reshape(1, 1)
+        return scale_tokens * residual_gate, shift_tokens * residual_gate
 
     def _build_layerwise_guidance(self, guidance_payload, batch_size, device):
         if guidance_payload is None or not self.use_guidance_merge:
@@ -382,41 +462,43 @@ class CortexGuidedVideoPredictor(nn.Module):
             self._maybe_move_tensor(guidance_payload.get("vlm_new_mask"), device)
         )
 
-        if old_stream is not None and old_stream.dim() != 3:
-            raise ValueError(f"vlm_old must be [L,S,D], got {tuple(old_stream.shape)}")
-        if new_stream is not None and new_stream.dim() != 3:
-            raise ValueError(f"vlm_new must be [L,S,D], got {tuple(new_stream.shape)}")
-
         if self.guidance_mode == "crossattn":
             layer_count = len(self.guidance_memory_readers)
         else:
             layer_count = len(self.guidance_fusion_mlps)
-
-        def _select_mask_layer(mask_bank, layer_index):
-            if mask_bank is None:
-                return None
-            if mask_bank.dim() == 1:
-                return mask_bank.to(dtype=torch.bool)
-            if layer_index < mask_bank.size(0):
-                return mask_bank[layer_index].to(dtype=torch.bool)
-            return mask_bank[-1].to(dtype=torch.bool)
+        old_stream = self._normalize_guidance_stream(old_stream, batch_size, "vlm_old")
+        new_stream = self._normalize_guidance_stream(new_stream, batch_size, "vlm_new")
+        old_mask = self._normalize_guidance_mask_bank(
+            old_mask, batch_size, "vlm_old_mask"
+        )
+        new_mask = self._normalize_guidance_mask_bank(
+            new_mask, batch_size, "vlm_new_mask"
+        )
 
         layer_payloads = []
         for layer_index in range(layer_count):
             old_tokens = self._project_guidance_layer(
-                old_stream, layer_index, self.guidance_old_adapter
+                old_stream, layer_index, layer_count, self.guidance_old_adapter
             )
             new_tokens = self._project_guidance_layer(
-                new_stream, layer_index, self.guidance_new_adapter
+                new_stream, layer_index, layer_count, self.guidance_new_adapter
             )
-            old_mask_layer = _select_mask_layer(old_mask, layer_index)
-            new_mask_layer = _select_mask_layer(new_mask, layer_index)
+            old_mask_layer = self._select_guidance_mask_layer(
+                old_mask, layer_index, layer_count
+            )
+            new_mask_layer = self._select_guidance_mask_layer(
+                new_mask, layer_index, layer_count
+            )
             if self.guidance_mode == "crossattn":
-                memory_tokens = self._build_cross_attention_memory(
-                    old_tokens, new_tokens, old_mask_layer, new_mask_layer, device
-                )
                 layer_payloads.append(
-                    memory_tokens.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+                    self._build_cross_attention_memory(
+                        old_tokens,
+                        new_tokens,
+                        old_mask_layer,
+                        new_mask_layer,
+                        batch_size,
+                        device,
+                    )
                 )
             else:
                 layer_payloads.append(
@@ -496,12 +578,13 @@ class CortexGuidedVideoPredictor(nn.Module):
             return rollout_stream
 
         if guidance_bank.mode == "crossattn":
-            memory_tokens = guidance_bank.layers[layer_index]
+            memory_tokens, key_padding_mask = guidance_bank.layers[layer_index]
             normalized_query = self.guidance_query_norms[layer_index](rollout_stream)
             attended_tokens, _ = self.guidance_memory_readers[layer_index](
                 normalized_query,
                 memory_tokens,
                 memory_tokens,
+                key_padding_mask=key_padding_mask,
                 need_weights=False,
             )
             residual_gate = torch.tanh(self.guidance_layer_scale[layer_index]).reshape(1, 1, 1)
@@ -511,6 +594,51 @@ class CortexGuidedVideoPredictor(nn.Module):
         if guidance_bank.mode == "adaln":
             rollout_stream = self.guidance_prenorms[layer_index](rollout_stream)
         return rollout_stream * (1.0 + scale_tokens.unsqueeze(1)) + shift_tokens.unsqueeze(1)
+
+    def _build_temporal_causal_attention_mask(self, sorted_lookup, has_cls=False):
+        """Allow every token to attend only to its own or an earlier frame.
+
+        PyTorch SDPA interprets ``True`` in a boolean mask as *allowed*.  Tokens
+        from one frame remain mutually visible, while every future frame is
+        blocked.  ``sorted_lookup`` contains the original flattened
+        ``frame * patches + patch`` indices, so this remains correct after the
+        context/query streams have been sorted together.
+        """
+        if not self.causal_attention:
+            return None
+        tokens_per_frame = int(self.grid_height * self.grid_width)
+        if tokens_per_frame <= 0:
+            raise ValueError("Cannot construct a causal mask with no spatial tokens")
+        frame_ids = torch.div(
+            sorted_lookup, tokens_per_frame, rounding_mode="floor"
+        )
+        # Training masks normally share one temporal layout across the batch;
+        # keep a broadcastable singleton mask instead of allocating B copies of
+        # the quadratic attention matrix.
+        if frame_ids.size(0) > 1 and torch.equal(
+            frame_ids, frame_ids[:1].expand_as(frame_ids)
+        ):
+            frame_ids = frame_ids[:1]
+        # [B, 1, query, key], broadcast across attention heads.
+        allowed = frame_ids[:, None, :, None] >= frame_ids[:, None, None, :]
+        if has_cls:
+            batch_size, _, token_count, _ = allowed.shape
+            with_cls = torch.zeros(
+                batch_size,
+                1,
+                token_count + 1,
+                token_count + 1,
+                dtype=torch.bool,
+                device=allowed.device,
+            )
+            # Keep the context-derived CLS token available as a read-only key.
+            # Its query attends only to itself, so future tokens cannot be
+            # routed back into earlier frames through CLS across layers.
+            with_cls[:, :, 0, 0] = True
+            with_cls[:, :, 1:, 0] = True
+            with_cls[:, :, 1:, 1:] = allowed
+            allowed = with_cls
+        return allowed
 
     @staticmethod
     def _recover_query_stream(rollout_stream, sort_order, visible_token_count):
@@ -547,6 +675,9 @@ class CortexGuidedVideoPredictor(nn.Module):
             target_groups,
             cls_token,
         )
+        temporal_attention_mask = self._build_temporal_causal_attention_mask(
+            sorted_lookup, has_cls=cls_token is not None
+        )
 
         expanded_batch = rollout_stream.size(0)
         guidance_bank = self._build_layerwise_guidance(ext, base_batch, device)
@@ -563,12 +694,20 @@ class CortexGuidedVideoPredictor(nn.Module):
                     rollout_layer,
                     rollout_stream,
                     sorted_lookup,
-                    None,
+                    temporal_attention_mask,
+                    self.grid_depth,
+                    self.grid_height,
+                    self.grid_width,
                     use_reentrant=False,
                 )
             else:
                 rollout_stream = rollout_layer(
-                    rollout_stream, mask=sorted_lookup, attn_mask=None
+                    rollout_stream,
+                    mask=sorted_lookup,
+                    attn_mask=temporal_attention_mask,
+                    T=self.grid_depth,
+                    H_patches=self.grid_height,
+                    W_patches=self.grid_width,
                 )
 
         rollout_stream = self.rollout_norm(rollout_stream)

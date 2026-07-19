@@ -11,4 +11,4 @@
 #
 # See LICENSE and NOTICE for release terms.
 #
-"""EgoDex dataset helpers used by the ThinkJEPA public release."""
+"""EgoDex dataset helpers used by ThinkJEPA."""

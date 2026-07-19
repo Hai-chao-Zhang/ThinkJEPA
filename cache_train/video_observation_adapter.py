@@ -34,6 +34,29 @@ def _coerce_crop_size(size_attr):
     raise ValueError(f"Unsupported crop size specification: {size_attr}")
 
 
+def resize_short_side_center_crop(
+    frames: torch.Tensor,
+    *,
+    short_side: int,
+    crop_height: int,
+    crop_width: int,
+    antialias: bool = True,
+) -> torch.Tensor:
+    """Apply the canonical V-JEPA eval geometry to ``[N,C,H,W]`` frames."""
+    if frames.ndim != 4:
+        raise ValueError(f"Expected [N,C,H,W], got {tuple(frames.shape)}")
+    from torchvision.transforms import InterpolationMode
+    from torchvision.transforms import functional as tvf
+
+    resized = tvf.resize(
+        frames,
+        int(short_side),
+        interpolation=InterpolationMode.BILINEAR,
+        antialias=bool(antialias),
+    )
+    return tvf.center_crop(resized, [int(crop_height), int(crop_width)])
+
+
 @torch.no_grad()
 def _read_spatial_recipe(eval_transform) -> SpatialAdaptationRecipe:
     detected_short_side = None
@@ -77,7 +100,7 @@ def _read_spatial_recipe(eval_transform) -> SpatialAdaptationRecipe:
 class VideoObservationAdapter(nn.Module):
     """Convert raw video tensors into the normalized layout expected by the JEPA encoder."""
 
-    def __init__(self, eval_transform, antialias: bool = False, device: str | None = None):
+    def __init__(self, eval_transform, antialias: bool = True, device: str | None = None):
         super().__init__()
         del device
         self.antialias = antialias
@@ -162,9 +185,12 @@ class VideoObservationAdapter(nn.Module):
             batch_size * num_frames, num_channels, frame_height, frame_width
         )
 
-        resized_frames, resized_height, resized_width = self._resize_short_side(flattened_frames)
-        cropped_frames = self._center_crop(
-            resized_frames, resized_height=resized_height, resized_width=resized_width
+        cropped_frames = resize_short_side_center_crop(
+            flattened_frames,
+            short_side=self.target_short_side,
+            crop_height=self.crop_height,
+            crop_width=self.crop_width,
+            antialias=self.antialias,
         )
 
         mean = self.channel_mean.to(cropped_frames.device, non_blocking=True)
