@@ -231,6 +231,14 @@ The training entry point fixes the following method settings:
 Batch sizes are per GPU. Training writes `ckpt_latest.pt` for resumption and
 `ckpt_best.pt` for the epoch with the lowest validation ADE.
 
+For the prepared 2,000-sample cache, a 200-epoch run on two H200 GPUs with
+batch size 16 per GPU (effective global batch size 32) is expected to take
+approximately 7 hours. Allow 7–8 hours depending on shared-storage throughput
+and system load. This estimate is based on cached ThinkJEPA training runs,
+includes validation after every epoch, and excludes queue time, cache download,
+and cache reconstruction. It assumes four data-loader workers per process and
+no competing GPU workload.
+
 ### Smoke test
 
 The smoke test uses the same model and data path as full training, bounded to
