@@ -1,0 +1,44 @@
+ThinkJEPA
+
+This product includes or is derived from ThinkJEPA.
+
+Original project:
+ThinkJEPA: Empowering Latent World Models with Large Vision-Language Reasoning Model
+
+Authors:
+- Haichao Zhang
+- Yun Raymond Fu
+
+Institution:
+Northeastern University, NEU SMILE LAB
+
+Original source repository:
+https://github.com/Hai-chao-Zhang/ThinkJEPA
+
+Recommended citation:
+If you use, modify, redistribute, evaluate, or publicly describe software that
+includes or is derived from ThinkJEPA, please retain this NOTICE file, retain
+the applicable LICENSE files, cite the ThinkJEPA paper where citation
+practices apply, and include a visible link to the original repository above.
+
+Recommended paper citation:
+Haichao Zhang, Yijiang Li, Shwai He, Tushar Nagarajan, Mingfei Chen,
+Jianglin Lu, Ang Li, and Yun Raymond Fu.
+"ThinkJEPA: Empowering Latent World Models with Large Vision-Language
+Reasoning Model."
+arXiv preprint arXiv:2603.22281, 2026.
+
+Third-party notice:
+- Files under `egodex/` and `egodex/utils/` retain
+  upstream Apple EgoDex attribution and should continue to ship with:
+  - `egodex/LICENSE.txt`
+  - `egodex/ACKNOWLEDGEMENTS.txt`
+  - `egodex/utils/LICENSE.txt`
+  - `egodex/utils/ACKNOWLEDGEMENTS.txt`
+- Files under `vjepa2/` retain upstream Meta/Facebook notices and should
+  continue to ship with:
+  - `vjepa2/LICENSE`
+  - `vjepa2/APACHE-LICENSE`
+- The root ThinkJEPA license applies to ThinkJEPA-authored material unless a
+  file or directory states otherwise; it does not replace separate third-party
+  notices distributed with this repository.

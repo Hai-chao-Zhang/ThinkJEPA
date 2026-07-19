@@ -1,0 +1,58 @@
+cff-version: 1.2.0
+message: "If you use ThinkJEPA, please cite the paper and link to the original repository."
+title: "ThinkJEPA"
+type: software
+repository-code: "https://github.com/Hai-chao-Zhang/ThinkJEPA"
+url: "https://github.com/Hai-chao-Zhang/ThinkJEPA"
+license: "LicenseRef-ThinkJEPA-Attribution"
+authors:
+  - family-names: "Zhang"
+    given-names: "Haichao"
+    website: "https://zhanghaichao.xyz"
+  - family-names: "Li"
+    given-names: "Yijiang"
+  - family-names: "He"
+    given-names: "Shwai"
+  - family-names: "Nagarajan"
+    given-names: "Tushar"
+  - family-names: "Chen"
+    given-names: "Mingfei"
+  - family-names: "Lu"
+    given-names: "Jianglin"
+  - family-names: "Li"
+    given-names: "Ang"
+  - family-names: "Fu"
+    given-names: "Yun Raymond"
+    website: "https://www1.ece.neu.edu/~yunfu/"
+keywords:
+  - "world models"
+  - "JEPA"
+  - "vision-language models"
+  - "video understanding"
+  - "latent world models"
+preferred-citation:
+  type: article
+  title: "ThinkJEPA: Empowering Latent World Models with Large Vision-Language Reasoning Model"
+  authors:
+    - family-names: "Zhang"
+      given-names: "Haichao"
+    - family-names: "Li"
+      given-names: "Yijiang"
+    - family-names: "He"
+      given-names: "Shwai"
+    - family-names: "Nagarajan"
+      given-names: "Tushar"
+    - family-names: "Chen"
+      given-names: "Mingfei"
+    - family-names: "Lu"
+      given-names: "Jianglin"
+    - family-names: "Li"
+      given-names: "Ang"
+    - family-names: "Fu"
+      given-names: "Yun Raymond"
+  journal: "arXiv preprint arXiv:2603.22281"
+  year: 2026
+  identifiers:
+    - type: other
+      value: "2603.22281"
+      description: "arXiv"

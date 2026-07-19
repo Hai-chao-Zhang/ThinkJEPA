@@ -1,0 +1,107 @@
+ThinkJEPA Attribution License
+(BSD-3-Clause-based, custom)
+
+SPDX-style identifier: LicenseRef-ThinkJEPA-Attribution
+
+Copyright (c) 2024-2026 Northeastern University.
+Developed in NEU SMILE LAB by Haichao Zhang (https://zhanghaichao.xyz)
+and Yun Raymond Fu (https://www1.ece.neu.edu/~yunfu/).
+All rights reserved.
+
+This is a custom, BSD-3-Clause-based attribution license for ThinkJEPA. It is
+not the standard BSD-3-Clause license and should not be described as an
+OSI-approved standard BSD license text.
+
+Unless a file, directory, or accompanying notice states otherwise, this
+license applies to the ThinkJEPA-authored material in this repository.
+Third-party components included with separate license files, notices, headers,
+or attribution statements remain subject to their own terms, and those terms
+must also be preserved where applicable.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions, the following disclaimer, any existing ThinkJEPA
+   attribution notices, and the original repository link:
+   https://github.com/Hai-chao-Zhang/ThinkJEPA
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions, the following disclaimer, any existing ThinkJEPA
+   attribution notices, and the original repository link:
+   https://github.com/Hai-chao-Zhang/ThinkJEPA
+   in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of Northeastern University, NEU SMILE LAB, nor the names
+   of the authors or contributors may be used to endorse or promote products
+   derived from this software without specific prior written permission.
+
+4. Any public redistribution of this software, in whole or in part, with or
+   without modification, including within another open-source or closed-source
+   repository, package, toolkit, benchmark, service, product, model release,
+   or documentation set, must include a visible attribution notice in a
+   user-facing location such as a top-level README, NOTICE file,
+   documentation page, about page, release page, package metadata page, or
+   equivalent materials.
+
+   The attribution notice must include, at minimum:
+   (a) the project name: "ThinkJEPA";
+   (b) a statement that the redistributed software includes or is derived from
+       ThinkJEPA; and
+   (c) the original repository link:
+       https://github.com/Hai-chao-Zhang/ThinkJEPA
+
+5. If a redistributed or derivative version modifies this software, the
+   redistributor must clearly state that changes were made and must not
+   misrepresent the modified version as the original ThinkJEPA project.
+
+6. For any public academic publication, technical report, white paper,
+   benchmark report, blog post, public documentation release, patent
+   application, patent specification, public prior-art disclosure, or similar
+   public material that materially uses, implements, evaluates, or builds upon
+   this software or a derivative work thereof, the user must provide
+   reasonable attribution to ThinkJEPA, to the extent permitted by the rules
+   of the relevant venue, publisher, patent office, or jurisdiction.
+
+   Such attribution must, where reasonably practicable and to the extent
+   permitted by the applicable rules, include:
+   (a) the name "ThinkJEPA";
+   (b) citation to the associated academic work, where a citation format is
+       applicable; and
+   (c) the original repository link:
+       https://github.com/Hai-chao-Zhang/ThinkJEPA
+
+   Where formal academic citation style is not applicable, this condition may
+   be satisfied by including the above attribution in an acknowledgments,
+   references, implementation details, prior-art, specification, notice, or
+   equivalent section.
+
+7. Public derivative repositories, packages, toolkits, services, or products
+   that include or build upon ThinkJEPA should preserve any applicable
+   third-party license files and notices shipped with this repository,
+   including original upstream repository references where those notices
+   require or recommend them.
+
+Compliant attribution example:
+
+  "This software includes or is derived from ThinkJEPA, originally developed
+  at Northeastern University, NEU SMILE LAB by Haichao Zhang and Yun Raymond
+  Fu. Original source: https://github.com/Hai-chao-Zhang/ThinkJEPA"
+
+Compliant modified-version example:
+
+  "Modified from ThinkJEPA (LicenseRef-ThinkJEPA-Attribution).
+  Changes were made to the original software. Original source:
+  https://github.com/Hai-chao-Zhang/ThinkJEPA"
+
+THIS SOFTWARE IS PROVIDED BY NORTHEASTERN UNIVERSITY AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL NORTHEASTERN UNIVERSITY OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
